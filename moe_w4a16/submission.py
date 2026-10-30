@@ -235,8 +235,9 @@ __device__ __forceinline__ void up_item(const __nv_bfloat16* __restrict__ x, con
         int i, row;
         elem(e2, i, row);
         if (i < n) {
-            gate *= gsc;
-            up *= gsc;
+            // SGLang keeps the GEMM outputs (gate, up) in BF16 before silu_and_mul.
+            gate = __bfloat162float(__float2bfloat16_rn(gate * gsc));
+            up = __bfloat162float(__float2bfloat16_rn(up * gsc));
             act[(size_t)routes[i] * I + tile * 16 + row] = __float2bfloat16_rn(gate / (1.f + __expf(-gate)) * up);
         }
     }
@@ -429,7 +430,7 @@ def _cuda():
     if _MOD is None:
         from torch.utils.cpp_extension import load_inline
         t0 = time.time()
-        _MOD = load_inline(name="muse_moe_v2c", cpp_sources=CPP_DECLS, cuda_sources=CUDA_SRC + CUDA_TORCH,
+        _MOD = load_inline(name="muse_moe_v2d", cpp_sources=CPP_DECLS, cuda_sources=CUDA_SRC + CUDA_TORCH,
                            functions=["moe_forward"], extra_cuda_cflags=["-O3"], verbose=False)
         print(f"CUDA compiled in {time.time() - t0:.0f}s", flush=True)
     return _MOD
