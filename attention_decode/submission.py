@@ -251,12 +251,21 @@ def _next_pow2(n):
     return 1 << int(round(math.log2(max(n, 1))))
 
 
-def _plan(batch, hkv, span, window):
-    """About two programs per SM, and at least 256 keys per chunk on sliding layers or
-    1,024 on full ones, where each chunk streams real bytes."""
+# (key block, warps) per shape class. The loop is latency-bound: an indirect
+# page-table load must finish before the KV gather can issue. Two resident CTAs per SM
+# overlap two such chains, which needs at most 255 registers at 128 threads. L=8 tiles use
+# 8 rows per head, so they take a 64-key block at 4 warps to stay at two CTAs; the L=1
+# full-context tiles take a 256-key block at 8 warps, halving the serial latency steps.
+_BN = {(1, 0): (256, 8), (1, 1): (128, 4), (8, 0): (64, 4), (8, 1): (64, 4)}
+
+
+def _plan(batch, length, hkv, span, window):
+    """About two programs per SM, plus the key block and warp count for the shape class."""
+    bn, warps = _BN[(8 if length > 1 else 1, 0 if not window else 1)]
+    floor = max(bn, 256 if window else 1024)
     nchunk = _next_pow2(max(1.0, 264.0 / (batch * hkv)))
-    nchunk = max(1, min(nchunk, span // (256 if window else 1024)))
-    return nchunk, -(-span // nchunk), 128
+    nchunk = max(1, min(nchunk, span // floor))
+    return nchunk, -(-span // nchunk), bn, warps
 
 
 def _setup(data):
@@ -268,8 +277,8 @@ def _setup(data):
     span = data["page_table"].shape[1] * page
     if window:
         span = min(span, window)
-    nchunk, chunk, bn = _plan(batch, hkv, span, window)
-    key = (batch, length, hq, hkv, d, page, window, span)
+    nchunk, chunk, bn, warps = _plan(batch, length, hkv, span, window)
+    key = (batch, length, hq, hkv, d, page, window, span, nchunk)
     bufs = _BUFFERS.get(key)
     if bufs is None:
         hrow = batch * length * hq
@@ -286,7 +295,7 @@ def _setup(data):
         if invf is None:
             invf = 1.0 / (float(theta) ** (torch.arange(0, d, 2, dtype=torch.float32, device=dev) / d))
             _INVF[theta] = invf
-    return key, nchunk, chunk, bn, bufs, invf
+    return key, nchunk, chunk, bn, warps, bufs, invf
 
 
 def kernel_fn(data: Inputs) -> torch.Tensor:
@@ -307,7 +316,7 @@ def kernel_fn(data: Inputs) -> torch.Tensor:
         ROPE=bool(cfg["rope_theta"]), PAGE=cfg["page_size"], NCHUNK=nchunk, CHUNK=chunk,
         BM=bm, BN=bn, BP=bp,
         SCALED_K=cfg["kv_scale"] != 1.0, SCALED_V=cfg["kv_scale"] != 1.0,
-        num_warps=8 if bm > 16 else 4,
+        num_warps=warps,
     )
     _combine_kernel[(batch * length * hq,)](
         data["qkv"], acc, pm, pl, out,
