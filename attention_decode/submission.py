@@ -253,10 +253,10 @@ def _next_pow2(n):
 
 # (key block, warps) per shape class. The loop is latency-bound: an indirect
 # page-table load must finish before the KV gather can issue. Two resident CTAs per SM
-# overlap two such chains, which needs at most 255 registers at 128 threads. L=8 tiles use
-# 8 rows per head, so they take a 64-key block at 4 warps to stay at two CTAs; the L=1
-# full-context tiles take a 256-key block at 8 warps, halving the serial latency steps.
-_BN = {(1, 0): (256, 8), (1, 1): (128, 4), (8, 0): (64, 4), (8, 1): (64, 4)}
+# overlap two such chains, which needs at most 255 registers at 128 threads. L=8 tiles run
+# 4 warps with a 128-key block (255 registers, two CTAs); the L=1 full-context tiles take a
+# 256-key block at 8 warps, halving the serial latency steps.
+_BN = {(1, 0): (256, 8), (1, 1): (128, 4), (8, 0): (128, 4), (8, 1): (128, 4)}
 
 
 def _plan(batch, length, hkv, span, window):
