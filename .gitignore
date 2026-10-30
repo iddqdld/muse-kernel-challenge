@@ -1,0 +1,7 @@
+/PAPERCUTS.md
+/LOG.md
+__pycache__/
+.venv/
+.tools/
+/docs/
+*/profiles/*.json

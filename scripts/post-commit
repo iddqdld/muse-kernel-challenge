@@ -1,0 +1,9 @@
+#!/bin/sh
+# Regenerate the local HTML documentation site after each commit.
+# docs/ is git-ignored: the site stays on this machine and is never committed.
+
+cd "$(git rev-parse --show-toplevel)" || exit 0
+command -v python3 >/dev/null 2>&1 || { printf 'post-commit: python3 not found\n' >&2; exit 0; }
+# Capture stderr only: gen_docs.py prints the pages it wrote on stdout.
+report=$(python3 scripts/gen_docs.py 2>&1 >/dev/null) || printf 'post-commit: gen_docs.py failed\n%s\n' "$report" >&2
+exit 0

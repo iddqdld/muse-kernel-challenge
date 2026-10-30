@@ -1,0 +1,6 @@
+{
+  "private": true,
+  "scripts": {
+    "papercut": "node scripts/papercut.mjs"
+  }
+}
