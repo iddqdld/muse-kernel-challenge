@@ -32,7 +32,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-BENCH = True
+BENCH = False
 
 
 class Weights(TypedDict):
@@ -380,14 +380,13 @@ LAYER_NAMES = ("qkv_gate", "o", "pooler", "unpooler", "router")
 
 # (layer, bucket) -> ("cuda", (rt, u, ksplit)), ("triton", (bm, bn, bk, split, warps, stages))
 # or ("torch", None). Filled from BENCH runs.
-PLAN = {  # check 1 (job 96a63235): the router beats SGLang; cuBLAS wins every BF16 layer for now
-    ("router", 1): ("triton", (16, 32, 256, 32, 4, 5)),
-    ("router", 8): ("triton", (16, 32, 256, 32, 4, 5)),
-    ("router", 16): ("triton", (16, 32, 256, 32, 4, 5)),
-    ("router", 32): ("triton", (32, 32, 128, 32, 4, 5)),
-    **{(layer, m): ("torch", None) for layer in ("qkv_gate", "o", "pooler", "unpooler") for m in (1, 8, 16, 32, 128, 256)},
-    ("router", 128): ("torch", None),
-    ("router", 256): ("torch", None),
+PLAN = {  # check 9f324e1a: CUDA GEMV where it beats cuBLAS; cuBLAS elsewhere
+    **{(layer, m): ("torch", None) for layer in LAYER_NAMES for m in BUCKETS},
+    ("qkv_gate", 1): ("cuda", (1, 8, 2)),
+    ("qkv_gate", 8): ("cuda", (1, 4, 4)),
+    ("unpooler", 1): ("cuda", (2, 2, 8)),
+    ("unpooler", 8): ("cuda", (1, 4, 4)),
+    **{("router", m): ("cuda", (1, 8, 8)) for m in (1, 8, 16, 32)},
 }
 
 
