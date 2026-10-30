@@ -1,0 +1,128 @@
+Traceback (most recent call last):
+  File "/tmp/muse_attention_decode-q81iy7gs/run/worker.py", line 484, in child_main
+    out = kernel()(state.get("data"))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/muse_attention_decode-q81iy7gs/run/submission.py", line 305, in kernel_fn
+    _, nchunk, chunk, bn, bufs, invf = _setup(data)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: too many values to unpack (expected 6)
+Traceback (most recent call last):
+  File "/tmp/muse_attention_decode-q81iy7gs/run/worker.py", line 484, in child_main
+    out = kernel()(state.get("data"))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/muse_attention_decode-q81iy7gs/run/submission.py", line 305, in kernel_fn
+    _, nchunk, chunk, bn, bufs, invf = _setup(data)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: too many values to unpack (expected 6)
+Traceback (most recent call last):
+  File "/tmp/muse_attention_decode-q81iy7gs/run/worker.py", line 484, in child_main
+    out = kernel()(state.get("data"))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/muse_attention_decode-q81iy7gs/run/submission.py", line 305, in kernel_fn
+    _, nchunk, chunk, bn, bufs, invf = _setup(data)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: too many values to unpack (expected 6)
+Traceback (most recent call last):
+  File "/tmp/muse_attention_decode-q81iy7gs/run/worker.py", line 484, in child_main
+    out = kernel()(state.get("data"))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/muse_attention_decode-q81iy7gs/run/submission.py", line 305, in kernel_fn
+    _, nchunk, chunk, bn, bufs, invf = _setup(data)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: too many values to unpack (expected 6)
+Traceback (most recent call last):
+  File "/tmp/muse_attention_decode-q81iy7gs/run/worker.py", line 484, in child_main
+    out = kernel()(state.get("data"))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/muse_attention_decode-q81iy7gs/run/submission.py", line 305, in kernel_fn
+    _, nchunk, chunk, bn, bufs, invf = _setup(data)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: too many values to unpack (expected 6)
+Traceback (most recent call last):
+  File "/tmp/muse_attention_decode-q81iy7gs/run/worker.py", line 484, in child_main
+    out = kernel()(state.get("data"))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/muse_attention_decode-q81iy7gs/run/submission.py", line 305, in kernel_fn
+    _, nchunk, chunk, bn, bufs, invf = _setup(data)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: too many values to unpack (expected 6)
+Traceback (most recent call last):
+  File "/tmp/muse_attention_decode-q81iy7gs/run/worker.py", line 484, in child_main
+    out = kernel()(state.get("data"))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/muse_attention_decode-q81iy7gs/run/submission.py", line 305, in kernel_fn
+    _, nchunk, chunk, bn, bufs, invf = _setup(data)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: too many values to unpack (expected 6)
+Traceback (most recent call last):
+  File "/tmp/muse_attention_decode-q81iy7gs/run/worker.py", line 484, in child_main
+    out = kernel()(state.get("data"))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/muse_attention_decode-q81iy7gs/run/submission.py", line 305, in kernel_fn
+    _, nchunk, chunk, bn, bufs, invf = _setup(data)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: too many values to unpack (expected 6)
+Traceback (most recent call last):
+  File "/tmp/muse_attention_decode-q81iy7gs/run/worker.py", line 484, in child_main
+    out = kernel()(state.get("data"))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/muse_attention_decode-q81iy7gs/run/submission.py", line 305, in kernel_fn
+    _, nchunk, chunk, bn, bufs, invf = _setup(data)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: too many values to unpack (expected 6)
+Traceback (most recent call last):
+  File "/tmp/muse_attention_decode-q81iy7gs/run/worker.py", line 484, in child_main
+    out = kernel()(state.get("data"))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/muse_attention_decode-q81iy7gs/run/submission.py", line 305, in kernel_fn
+    _, nchunk, chunk, bn, bufs, invf = _setup(data)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: too many values to unpack (expected 6)
+Traceback (most recent call last):
+  File "/tmp/muse_attention_decode-q81iy7gs/run/worker.py", line 484, in child_main
+    out = kernel()(state.get("data"))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/muse_attention_decode-q81iy7gs/run/submission.py", line 305, in kernel_fn
+    _, nchunk, chunk, bn, bufs, invf = _setup(data)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: too many values to unpack (expected 6)
+Traceback (most recent call last):
+  File "/tmp/muse_attention_decode-q81iy7gs/run/worker.py", line 484, in child_main
+    out = kernel()(state.get("data"))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/muse_attention_decode-q81iy7gs/run/submission.py", line 305, in kernel_fn
+    _, nchunk, chunk, bn, bufs, invf = _setup(data)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: too many values to unpack (expected 6)
+Traceback (most recent call last):
+  File "/tmp/muse_attention_decode-q81iy7gs/run/worker.py", line 484, in child_main
+    out = kernel()(state.get("data"))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/muse_attention_decode-q81iy7gs/run/submission.py", line 305, in kernel_fn
+    _, nchunk, chunk, bn, bufs, invf = _setup(data)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: too many values to unpack (expected 6)
+Traceback (most recent call last):
+  File "/tmp/muse_attention_decode-q81iy7gs/run/worker.py", line 484, in child_main
+    out = kernel()(state.get("data"))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/muse_attention_decode-q81iy7gs/run/submission.py", line 305, in kernel_fn
+    _, nchunk, chunk, bn, bufs, invf = _setup(data)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: too many values to unpack (expected 6)
+Traceback (most recent call last):
+  File "/tmp/muse_attention_decode-q81iy7gs/run/worker.py", line 484, in child_main
+    out = kernel()(state.get("data"))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/muse_attention_decode-q81iy7gs/run/submission.py", line 305, in kernel_fn
+    _, nchunk, chunk, bn, bufs, invf = _setup(data)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: too many values to unpack (expected 6)
+Traceback (most recent call last):
+  File "/tmp/muse_attention_decode-q81iy7gs/run/worker.py", line 484, in child_main
+    out = kernel()(state.get("data"))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/muse_attention_decode-q81iy7gs/run/submission.py", line 305, in kernel_fn
+    _, nchunk, chunk, bn, bufs, invf = _setup(data)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: too many values to unpack (expected 6)

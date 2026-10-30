@@ -302,7 +302,7 @@ def kernel_fn(data: Inputs) -> torch.Tensor:
     cfg = data["config"]
     batch, length = cfg["batch"], cfg["q_len"]
     hq, hkv, d = cfg["num_q_heads"], cfg["num_kv_heads"], cfg["head_dim"]
-    _, nchunk, chunk, bn, bufs, invf = _setup(data)
+    _, nchunk, chunk, bn, warps, bufs, invf = _setup(data)
     acc, pm, pl = bufs
     out = torch.empty((batch, length, hq * d), dtype=torch.bfloat16, device=data["qkv"].device)
     bm = max(16, length * (hq // hkv))
