@@ -32,7 +32,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-BENCH = False
+BENCH = True
 
 
 class Weights(TypedDict):
@@ -83,12 +83,15 @@ __device__ __forceinline__ void mma_bf16(float* c, int a0, int a1, int a2, int a
 // Lane (g = lane / 4, t = lane % 4) holds W rows g and g + 8 of each 16-row tile and token g
 // of each 8-token tile; per 32-wide k block it loads k in [8t, 8t + 8) as one int4. MMA step 0
 // uses k 8t + 0..3 (fragment slots 2t, 2t+1, 2t+8, 2t+9), step 1 uses k 8t + 4..7.
+// W is packed (see pack_weight in Python): per 16-row tile and 32-wide k block, 64 int4s, rows
+// 0-7 then rows 8-15, lane-major. So one warp load reads 512 contiguous bytes, and a tile's
+// whole K range is one linear stream.
 template <int RT, int MT, int U, bool OUT_F32>
 __global__ void __launch_bounds__(256) skinny_mma_kernel(
-        const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
+        const __nv_bfloat16* __restrict__ x, const int4* __restrict__ w,
         void* __restrict__ out, int M, int N, int KX, int KW, int k_cta) {
     constexpr int E = RT * MT * 4 * 32;  // accumulator floats per warp
-    __shared__ float red[8][E];
+    __shared__ float red[4][E];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const int row0 = blockIdx.x * 16 * RT;
     const int kw = k_cta >> 3;  // k per warp
@@ -102,10 +105,10 @@ __global__ void __launch_bounds__(256) skinny_mma_kernel(
 #pragma unroll
             for (int j = 0; j < 4; ++j) acc[rt][nt][j] = 0.f;
 
-    const __nv_bfloat16* wrow[RT];
+    const size_t nb = KW >> 5;  // 32-wide k blocks per row
+    const int4* wt[RT];
 #pragma unroll
-    for (int rt = 0; rt < RT; ++rt) wrow[rt] = w + (size_t)(row0 + rt * 16 + g) * KW + t * 8;
-    const size_t w8 = (size_t)8 * KW;  // row g + 8
+    for (int rt = 0; rt < RT; ++rt) wt[rt] = w + (size_t)(blockIdx.x * RT + rt) * nb * 64 + lane;
     const __nv_bfloat16* xrow[MT];
     bool xok[MT];
 #pragma unroll
@@ -122,8 +125,9 @@ __global__ void __launch_bounds__(256) skinny_mma_kernel(
         for (int u = 0; u < U; ++u) {
 #pragma unroll
             for (int rt = 0; rt < RT; ++rt) {
-                wa[u][rt] = ld_stream(wrow[rt] + kb + u * 32);
-                wb[u][rt] = ld_stream(wrow[rt] + w8 + kb + u * 32);
+                const int4* p = wt[rt] + (size_t)((kb >> 5) + u) * 64;
+                wa[u][rt] = ld_stream(p);
+                wb[u][rt] = ld_stream(p + 32);
             }
 #pragma unroll
             for (int nt = 0; nt < MT; ++nt)
@@ -143,20 +147,33 @@ __global__ void __launch_bounds__(256) skinny_mma_kernel(
                 }
     }
 
-    // The 8 warps of the CTA: sum their partials into red[0].
+    // The 8 warps of the CTA: warps 4-7 hand their partials to warps 0-3, then all threads add
+    // the 4 remaining copies into red[0]. Two rounds keep shared memory at 4 copies.
+    if (warp >= 4)
 #pragma unroll
-    for (int rt = 0; rt < RT; ++rt)
+        for (int rt = 0; rt < RT; ++rt)
 #pragma unroll
-        for (int nt = 0; nt < MT; ++nt)
+            for (int nt = 0; nt < MT; ++nt)
 #pragma unroll
-            for (int j = 0; j < 4; ++j) red[warp][((rt * MT + nt) * 4 + j) * 32 + lane] = acc[rt][nt][j];
+                for (int j = 0; j < 4; ++j) red[warp - 4][((rt * MT + nt) * 4 + j) * 32 + lane] = acc[rt][nt][j];
     __syncthreads();
-    for (int e = threadIdx.x; e < E; e += 256) {
-        float s = 0.f;
+    if (warp < 4)
 #pragma unroll
-        for (int q = 0; q < 8; ++q) s += red[q][e];
-        red[0][e] = s;
-    }
+        for (int rt = 0; rt < RT; ++rt)
+#pragma unroll
+            for (int nt = 0; nt < MT; ++nt)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) acc[rt][nt][j] += red[warp][((rt * MT + nt) * 4 + j) * 32 + lane];
+    __syncthreads();
+    if (warp < 4)
+#pragma unroll
+        for (int rt = 0; rt < RT; ++rt)
+#pragma unroll
+            for (int nt = 0; nt < MT; ++nt)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) red[warp][((rt * MT + nt) * 4 + j) * 32 + lane] = acc[rt][nt][j];
+    __syncthreads();
+    for (int e = threadIdx.x; e < E; e += 256) red[0][e] = red[0][e] + red[1][e] + red[2][e] + red[3][e];
 
     const int ksplit = gridDim.y;
     bool writer = true;
@@ -183,53 +200,26 @@ __global__ void __launch_bounds__(256) skinny_mma_kernel(
     }
 }
 
-// Bandwidth probe: read n16 int4s, either grid-strided (chunked = 0) or one contiguous chunk per CTA.
-template <int UNROLL>
-__global__ void read_bw_kernel(const int4* __restrict__ p, long long n16, int chunked, int* sink) {
-    long long i, step, end;
-    if (chunked) {
-        const long long chunk = (n16 + gridDim.x - 1) / gridDim.x;
-        i = blockIdx.x * chunk + threadIdx.x;
-        end = min(n16, (blockIdx.x + 1) * chunk);
-        step = blockDim.x;
-    } else {
-        i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-        end = n16;
-        step = (long long)gridDim.x * blockDim.x;
-    }
-    int acc = 0;
-    for (; i + (UNROLL - 1) * step < end; i += UNROLL * step) {
-        int4 v[UNROLL];
-#pragma unroll
-        for (int u = 0; u < UNROLL; ++u) v[u] = ld_stream(p + i + u * step);
-#pragma unroll
-        for (int u = 0; u < UNROLL; ++u) acc ^= v[u].x ^ v[u].y ^ v[u].z ^ v[u].w;
-    }
-    for (; i < end; i += step) {
-        const int4 v = ld_stream(p + i);
-        acc ^= v.x ^ v.y ^ v.z ^ v.w;
-    }
-    if (acc == 0x7fffffff) sink[0] = acc;  // keeps the loads alive
-}
-
 template <int RT, int MT, int U>
 static cudaError_t launch_rmu(cudaLaunchConfig_t* cfg, bool f32, const __nv_bfloat16* x,
-                              const __nv_bfloat16* w, void* out, int M, int N, int KX, int KW, int k_cta) {
+                              const int4* w, void* out, int M, int N, int KX, int KW, int k_cta) {
     if (f32) return cudaLaunchKernelEx(cfg, skinny_mma_kernel<RT, MT, U, true>, x, w, out, M, N, KX, KW, k_cta);
     return cudaLaunchKernelEx(cfg, skinny_mma_kernel<RT, MT, U, false>, x, w, out, M, N, KX, KW, k_cta);
 }
 
 template <int RT, int MT>
 static cudaError_t launch_rm(cudaLaunchConfig_t* cfg, int u, bool f32, const __nv_bfloat16* x,
-                             const __nv_bfloat16* w, void* out, int M, int N, int KX, int KW, int k_cta) {
-    if (u == 8) return launch_rmu<RT, MT, 8>(cfg, f32, x, w, out, M, N, KX, KW, k_cta);
+                             const int4* w, void* out, int M, int N, int KX, int KW, int k_cta) {
+    if constexpr (RT <= 2) {  // RT 4 with U 8 would hold 256 registers of W
+        if (u == 8) return launch_rmu<RT, MT, 8>(cfg, f32, x, w, out, M, N, KX, KW, k_cta);
+    }
     if (u == 2) return launch_rmu<RT, MT, 2>(cfg, f32, x, w, out, M, N, KX, KW, k_cta);
     return launch_rmu<RT, MT, 4>(cfg, f32, x, w, out, M, N, KX, KW, k_cta);
 }
 
 template <int RT>
 static cudaError_t launch_r(cudaLaunchConfig_t* cfg, int mt, int u, bool f32, const __nv_bfloat16* x,
-                            const __nv_bfloat16* w, void* out, int M, int N, int KX, int KW, int k_cta) {
+                            const int4* w, void* out, int M, int N, int KX, int KW, int k_cta) {
     if (mt == 1) return launch_rm<RT, 1>(cfg, u, f32, x, w, out, M, N, KX, KW, k_cta);
     if (mt == 2) return launch_rm<RT, 2>(cfg, u, f32, x, w, out, M, N, KX, KW, k_cta);
     return launch_rm<RT, 4>(cfg, u, f32, x, w, out, M, N, KX, KW, k_cta);
@@ -251,19 +241,10 @@ cudaError_t skinny_mma_launch(const void* x, const void* w, void* out, bool f32,
     const int mt = M <= 8 ? 1 : M <= 16 ? 2 : 4;
     const int k_cta = KW / ksplit;
     auto xp = static_cast<const __nv_bfloat16*>(x);
-    auto wp = static_cast<const __nv_bfloat16*>(w);
+    auto wp = static_cast<const int4*>(w);
+    if (rt == 4) return launch_r<4>(&cfg, mt, u, f32, xp, wp, out, M, N, KX, KW, k_cta);
     if (rt == 2) return launch_r<2>(&cfg, mt, u, f32, xp, wp, out, M, N, KX, KW, k_cta);
     return launch_r<1>(&cfg, mt, u, f32, xp, wp, out, M, N, KX, KW, k_cta);
-}
-
-cudaError_t read_bw_launch(const void* p, long long bytes, int grid, int block, int unroll, int chunked,
-                           int* sink, cudaStream_t stream) {
-    const long long n16 = bytes / 16;
-    auto q = static_cast<const int4*>(p);
-    if (unroll == 16) read_bw_kernel<16><<<grid, block, 0, stream>>>(q, n16, chunked, sink);
-    else if (unroll == 4) read_bw_kernel<4><<<grid, block, 0, stream>>>(q, n16, chunked, sink);
-    else read_bw_kernel<8><<<grid, block, 0, stream>>>(q, n16, chunked, sink);
-    return cudaGetLastError();
 }
 """
 
@@ -273,31 +254,20 @@ CUDA_TORCH = r"""
 
 cudaError_t skinny_mma_launch(const void* x, const void* w, void* out, bool f32, int M, int N, int KX,
                               int KW, int rt, int u, int ksplit, cudaStream_t stream);
-cudaError_t read_bw_launch(const void* p, long long bytes, int grid, int block, int unroll, int chunked,
-                           int* sink, cudaStream_t stream);
 
-void skinny_mma(torch::Tensor x, torch::Tensor w, torch::Tensor out, int64_t kx, int64_t rt, int64_t u,
-                int64_t ksplit) {
-    TORCH_CHECK(x.is_contiguous() && w.is_contiguous() && out.is_contiguous());
+void skinny_mma(torch::Tensor x, torch::Tensor w_packed, torch::Tensor out, int64_t kx, int64_t kw,
+                int64_t rt, int64_t u, int64_t ksplit) {
+    TORCH_CHECK(x.is_contiguous() && w_packed.is_contiguous() && out.is_contiguous());
     const cudaError_t err = skinny_mma_launch(
-        x.data_ptr(), w.data_ptr(), out.data_ptr(), out.scalar_type() == at::kFloat, x.size(0),
-        out.size(1), kx, w.size(1), rt, u, ksplit, at::cuda::getCurrentCUDAStream());
+        x.data_ptr(), w_packed.data_ptr(), out.data_ptr(), out.scalar_type() == at::kFloat, x.size(0),
+        out.size(1), kx, kw, rt, u, ksplit, at::cuda::getCurrentCUDAStream());
     TORCH_CHECK(err == cudaSuccess, "skinny_mma: ", cudaGetErrorString(err));
-}
-
-void read_bw(torch::Tensor buf, int64_t bytes, int64_t grid, int64_t block, int64_t unroll, int64_t chunked,
-             torch::Tensor sink) {
-    const cudaError_t err = read_bw_launch(buf.data_ptr(), bytes, grid, block, unroll, chunked,
-                                           sink.data_ptr<int>(), at::cuda::getCurrentCUDAStream());
-    TORCH_CHECK(err == cudaSuccess, "read_bw: ", cudaGetErrorString(err));
 }
 """
 
 CPP_DECLS = """
-void skinny_mma(torch::Tensor x, torch::Tensor w, torch::Tensor out, int64_t kx, int64_t rt, int64_t u,
-                int64_t ksplit);
-void read_bw(torch::Tensor buf, int64_t bytes, int64_t grid, int64_t block, int64_t unroll, int64_t chunked,
-             torch::Tensor sink);
+void skinny_mma(torch::Tensor x, torch::Tensor w_packed, torch::Tensor out, int64_t kx, int64_t kw,
+                int64_t rt, int64_t u, int64_t ksplit);
 """
 
 _MOD = None
@@ -311,8 +281,8 @@ def _cuda():
         t0 = time.time()
         try:
             _MOD = load_inline(
-                name="muse_bf16_proj_v2", cpp_sources=CPP_DECLS, cuda_sources=CUDA_KERNELS + CUDA_TORCH,
-                functions=["skinny_mma", "read_bw"], extra_cuda_cflags=["-O3"], verbose=False)
+                name="muse_bf16_proj_v3", cpp_sources=CPP_DECLS, cuda_sources=CUDA_KERNELS + CUDA_TORCH,
+                functions=["skinny_mma"], extra_cuda_cflags=["-O3"], verbose=False)
             print(f"CUDA compiled in {time.time() - t0:.0f}s", flush=True)
         except Exception as e:  # noqa: BLE001 - fall back to Triton / cuBLAS and say why
             print(f"CUDA compile failed after {time.time() - t0:.0f}s: {str(e)[-3000:]}", flush=True)
@@ -423,11 +393,18 @@ def _triton(x, state, layer, n, cfg):
     return out
 
 
+def pack_weight(w):
+    """[N, K] -> fragment order for skinny_mma_kernel: per 16-row tile and 32-wide k block, rows
+    0-7 then rows 8-15, each as lanes (row r, k quarter q) -> 16 bytes, lane = 4 * r + q."""
+    n, k = w.shape
+    return w.view(n // 16, 2, 8, k // 32, 4, 8).permute(0, 3, 1, 2, 4, 5).contiguous()
+
+
 def _cuda_proj(x, state, layer, n, cfg):
     rt, u, ksplit = cfg
     w, k_x = _weight(state, layer)
     out = _out(x, layer, n)
-    _MOD.skinny_mma(x, w, out, k_x, rt, u, ksplit)
+    _MOD.skinny_mma(x, state["packed"][layer], out, k_x, w.shape[1], rt, u, ksplit)
     return out
 
 
@@ -458,6 +435,8 @@ def prepare(weights: Weights):
     state["ws"] = torch.empty(WS_FLOATS, device=dev, dtype=torch.float32)
     state["cnt"] = torch.zeros(COUNTERS, device=dev, dtype=torch.int32)
     state["plan"] = dict(PLAN)
+    state["packed"] = {name: pack_weight(state[name]) for name in ("qkv_gate", "o", "pooler", "unpooler")}
+    state["packed"]["router"] = pack_weight(state["router_hilo"])
     if BENCH or any(kind == "cuda" for kind, _ in PLAN.values()):
         _cuda()
     if BENCH:
@@ -507,38 +486,13 @@ def _graph_us(fn, flush, reps=30):
     return ts[len(ts) // 2], out
 
 
-def _bandwidth(flush):
-    """What a plain read kernel reaches: net us and TB/s per size, grid, block and unroll."""
-    sink = torch.zeros(1, device=flush.device, dtype=torch.int32)
-    sizes = {"router 8.4MB": 256 * 8192 * 4, "o 16.8MB": 8192 * 1024 * 2,
-             "qkv 37.7MB": 2304 * 8192 * 2, "pooler 67.1MB": 4096 * 8192 * 2}
-    src = torch.empty(max(sizes.values()) // 2, device=flush.device, dtype=torch.bfloat16).normal_()
-    for name, nbytes in sizes.items():
-        best = {}
-        for chunked in (0, 1):
-            for grid in (132, 264, 528, 1056, 2112):
-                for block in (256, 512):
-                    for unroll in (4, 8, 16):
-                        t, _ = _graph_us(lambda: _MOD.read_bw(src, nbytes, grid, block, unroll, chunked, sink), flush)
-                        key = (chunked, grid)
-                        if key not in best or t < best[key][0]:
-                            best[key] = (t, block, unroll)
-        for chunked in (0, 1):
-            cells = []
-            for grid in (132, 264, 528, 1056, 2112):
-                t, block, unroll = best[(chunked, grid)]
-                net = t - FIXED_US
-                cells.append(f"g{grid}:{net:.2f}us/{nbytes / net / 1e6:.2f}TB/s(b{block}u{unroll})")
-            print(f"BW {name} {'chunked' if chunked else 'strided'} " + " ".join(cells), flush=True)
-
-
 def _variants(m, layer, n, k_w):
     out = [("torch", None)]
-    if PLAN.get((layer, m), ("torch",))[0] == "triton":
+    if PLAN.get((layer, m), ("torch",))[0] != "torch":
         out.append(PLAN[(layer, m)])
     if m <= 32 and _MOD:
-        for rt in (1, 2):
-            for u in (2, 4, 8):
+        for rt in (1, 2, 4):
+            for u in ((2, 4) if rt == 4 else (2, 4, 8)):
                 for ks in (1, 2, 4, 8):
                     ctas = n // (16 * rt) * ks
                     if n % (16 * rt) or k_w % (ks * 8 * 32 * u) or not 64 <= ctas <= 2112:
@@ -556,8 +510,6 @@ def _sweep(state, budget_s=170.0):
     dev = state["ws"].device
     l2 = torch.cuda.get_device_properties(0).L2_cache_size
     flush = torch.empty(max(4 * l2, 256 << 20) // 4, device=dev, dtype=torch.float32).fill_(1.0)
-    if _MOD:
-        _bandwidth(flush)
     gen = torch.Generator(device=dev).manual_seed(1)
     rows, load_t = [], {}
     for m in BUCKETS:
