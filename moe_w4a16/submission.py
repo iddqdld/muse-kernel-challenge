@@ -249,7 +249,7 @@ template <int MT>
 __device__ __forceinline__ void down_item(const __nv_bfloat16* __restrict__ act, const int* __restrict__ routes, int n,
                                           int e, int tile, const int4* __restrict__ codes,
                                           const int4* __restrict__ scales, float gsc,
-                                          const float* __restrict__ onepw, __nv_bfloat16* __restrict__ ybuf,
+                                          const __nv_bfloat16* __restrict__ norm_w, __nv_bfloat16* __restrict__ ybuf,
                                           float* __restrict__ ssq, float* red, float* sq) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const size_t tb = (size_t)e * (H / 16) + tile;
@@ -275,7 +275,7 @@ __device__ __forceinline__ void down_item(const __nv_bfloat16* __restrict__ act,
             const int col = tile * 16 + row;
             const __nv_bfloat16 yb = __float2bfloat16_rn(y * gsc);
             ybuf[(size_t)routes[i] * H + col] = yb;
-            const float v = __bfloat162float(yb) * onepw[col];
+            const float v = __bfloat162float(yb) * (1.f + __bfloat162float(norm_w[col]));
             atomicAdd(&sq[i], v * v);
         }
     }
@@ -305,7 +305,7 @@ __global__ void __launch_bounds__(256, 2) moe_up_kernel(
 __global__ void __launch_bounds__(256, 2) moe_down_kernel(
         const __nv_bfloat16* __restrict__ act, const int* __restrict__ meta, const int* __restrict__ list,
         int local_start, const int4* __restrict__ codes, const int4* __restrict__ scales,
-        const float* __restrict__ gs, const float* __restrict__ onepw, __nv_bfloat16* __restrict__ ybuf,
+        const float* __restrict__ gs, const __nv_bfloat16* __restrict__ norm_w, __nv_bfloat16* __restrict__ ybuf,
         float* __restrict__ ssq) {
     __shared__ float red[8 * 4 * 128];
     __shared__ float sq[32];
@@ -315,21 +315,22 @@ __global__ void __launch_bounds__(256, 2) moe_down_kernel(
         const int e = meta[META_E + grp], n = meta[META_N + grp];
         const int* routes = list + meta[META_BEG + grp];
         const float gsc = gs[local_start + e] * 256.f;
-        if (n <= 8) down_item<1>(act, routes, n, e, tile, codes, scales, gsc, onepw, ybuf, ssq, red, sq);
-        else if (n <= 16) down_item<2>(act, routes, n, e, tile, codes, scales, gsc, onepw, ybuf, ssq, red, sq);
-        else down_item<4>(act, routes, n, e, tile, codes, scales, gsc, onepw, ybuf, ssq, red, sq);
+        if (n <= 8) down_item<1>(act, routes, n, e, tile, codes, scales, gsc, norm_w, ybuf, ssq, red, sq);
+        else if (n <= 16) down_item<2>(act, routes, n, e, tile, codes, scales, gsc, norm_w, ybuf, ssq, red, sq);
+        else down_item<4>(act, routes, n, e, tile, codes, scales, gsc, norm_w, ybuf, ssq, red, sq);
     }
 }
 
 // grid M, 256 threads, 16 columns each:
 // out[t] = sum over local routes of w * y * (1 + post_norm_w) * rsqrt(mean((y * (1 + post_norm_w))^2) + eps).
 __global__ void __launch_bounds__(256) moe_combine_kernel(
-        const int* __restrict__ ids, const float* __restrict__ wts, int local_start, const float* __restrict__ onepw,
+        const int* __restrict__ ids, const float* __restrict__ wts, int local_start,
+        const __nv_bfloat16* __restrict__ norm_w,
         const __nv_bfloat16* __restrict__ ybuf, const float* __restrict__ ssq, __nv_bfloat16* __restrict__ out) {
     const int tok = blockIdx.x, c = threadIdx.x * 16;
     float acc[16] = {}, nw[16];
 #pragma unroll
-    for (int q = 0; q < 16; ++q) nw[q] = onepw[c + q];
+    for (int q = 0; q < 16; ++q) nw[q] = 1.f + __bfloat162float(norm_w[c + q]);
     for (int s = 0; s < TOPK; ++s) {
         const int r = tok * TOPK + s, e = ids[r] - local_start;
         if (e < 0 || e >= LOCAL) continue;
@@ -351,7 +352,7 @@ __global__ void __launch_bounds__(256) moe_combine_kernel(
 
 cudaError_t moe_launch(const void* x, const int* ids, const float* wts, int M, int local_start,
                        const void* c13, const void* s13, const float* gs13, const void* c2, const void* s2,
-                       const float* gs2, const float* onepw, void* act, void* ybuf, float* ssq, int* meta,
+                       const float* gs2, const void* norm_w, void* act, void* ybuf, float* ssq, int* meta,
                        int* list, int grid, void* out, cudaStream_t st) {
     const int n_ids = M * TOPK;
     if (n_ids > 32 * MAX_GROUPS - 32 * LOCAL) return cudaErrorInvalidValue;  // groups always fit
@@ -359,8 +360,9 @@ cudaError_t moe_launch(const void* x, const int* ids, const float* wts, int M, i
     moe_up_kernel<<<grid, 256, 0, st>>>((const __nv_bfloat16*)x, meta, list, local_start, (const int4*)c13,
                                         (const int4*)s13, gs13, (__nv_bfloat16*)act);
     moe_down_kernel<<<grid, 256, 0, st>>>((const __nv_bfloat16*)act, meta, list, local_start, (const int4*)c2,
-                                          (const int4*)s2, gs2, onepw, (__nv_bfloat16*)ybuf, ssq);
-    moe_combine_kernel<<<M, 256, 0, st>>>(ids, wts, local_start, onepw, (const __nv_bfloat16*)ybuf, ssq,
+                                          (const int4*)s2, gs2, (const __nv_bfloat16*)norm_w, (__nv_bfloat16*)ybuf, ssq);
+    moe_combine_kernel<<<M, 256, 0, st>>>(ids, wts, local_start, (const __nv_bfloat16*)norm_w,
+                                          (const __nv_bfloat16*)ybuf, ssq,
                                           (__nv_bfloat16*)out);
     return cudaGetLastError();
 }
@@ -372,17 +374,17 @@ CUDA_TORCH = r"""
 
 cudaError_t moe_launch(const void* x, const int* ids, const float* wts, int M, int local_start,
                        const void* c13, const void* s13, const float* gs13, const void* c2, const void* s2,
-                       const float* gs2, const float* onepw, void* act, void* ybuf, float* ssq, int* meta,
+                       const float* gs2, const void* norm_w, void* act, void* ybuf, float* ssq, int* meta,
                        int* list, int grid, void* out, cudaStream_t st);
 
 void moe_forward(torch::Tensor x, torch::Tensor ids, torch::Tensor wts, int64_t local_start,
                  torch::Tensor c13, torch::Tensor s13, torch::Tensor gs13, torch::Tensor c2, torch::Tensor s2,
-                 torch::Tensor gs2, torch::Tensor onepw, torch::Tensor act, torch::Tensor ybuf, torch::Tensor ssq,
+                 torch::Tensor gs2, torch::Tensor norm_w, torch::Tensor act, torch::Tensor ybuf, torch::Tensor ssq,
                  torch::Tensor meta, torch::Tensor list, int64_t grid, torch::Tensor out) {
     const cudaError_t err = moe_launch(
         x.data_ptr(), ids.data_ptr<int>(), wts.data_ptr<float>(), x.size(0), local_start, c13.data_ptr(),
         s13.data_ptr(), gs13.data_ptr<float>(), c2.data_ptr(), s2.data_ptr(), gs2.data_ptr<float>(),
-        onepw.data_ptr<float>(), act.data_ptr(), ybuf.data_ptr(), ssq.data_ptr<float>(),
+        norm_w.data_ptr(), act.data_ptr(), ybuf.data_ptr(), ssq.data_ptr<float>(),
         meta.data_ptr<int>(), list.data_ptr<int>(), grid, out.data_ptr(), at::cuda::getCurrentCUDAStream());
     TORCH_CHECK(err == cudaSuccess, "moe_forward: ", cudaGetErrorString(err));
 }
@@ -391,7 +393,7 @@ void moe_forward(torch::Tensor x, torch::Tensor ids, torch::Tensor wts, int64_t 
 CPP_DECLS = """
 void moe_forward(torch::Tensor x, torch::Tensor ids, torch::Tensor wts, int64_t local_start,
                  torch::Tensor c13, torch::Tensor s13, torch::Tensor gs13, torch::Tensor c2, torch::Tensor s2,
-                 torch::Tensor gs2, torch::Tensor onepw, torch::Tensor act, torch::Tensor ybuf, torch::Tensor ssq,
+                 torch::Tensor gs2, torch::Tensor norm_w, torch::Tensor act, torch::Tensor ybuf, torch::Tensor ssq,
                  torch::Tensor meta, torch::Tensor list, int64_t grid, torch::Tensor out);
 """
 
@@ -427,7 +429,7 @@ def _cuda():
     if _MOD is None:
         from torch.utils.cpp_extension import load_inline
         t0 = time.time()
-        _MOD = load_inline(name="muse_moe_v2b", cpp_sources=CPP_DECLS, cuda_sources=CUDA_SRC + CUDA_TORCH,
+        _MOD = load_inline(name="muse_moe_v2c", cpp_sources=CPP_DECLS, cuda_sources=CUDA_SRC + CUDA_TORCH,
                            functions=["moe_forward"], extra_cuda_cflags=["-O3"], verbose=False)
         print(f"CUDA compiled in {time.time() - t0:.0f}s", flush=True)
     return _MOD
@@ -439,7 +441,7 @@ def prepare(weights: Weights):
         "c13": pack_codes(weights["w13"][loc]), "s13": pack_scales(weights["w13_sf"][loc]),
         "c2": pack_codes(weights["w2"][loc]), "s2": pack_scales(weights["w2_sf"][loc]),
         "gs13": weights["w13_gs"].float().contiguous(), "gs2": weights["w2_gs"].float().contiguous(),
-        "onepw": (1.0 + weights["post_norm_w"].float()).contiguous(),
+        "norm_w": weights["post_norm_w"].contiguous(),  # BF16, as given; kernels use 1 + w
         "meta": torch.zeros(1 + 3 * MAX_GROUPS, device=weights["w13"].device, dtype=torch.int32),
         "grid": 2 * torch.cuda.get_device_properties(weights["w13"].device).multi_processor_count,
     }
@@ -458,5 +460,5 @@ def kernel_fn(data: Inputs, state) -> torch.Tensor:
     routes = torch.empty((m * 8,), device=x.device, dtype=torch.int32)
     _MOD.moe_forward(x, ids, data["topk_weights"].contiguous(), data["config"]["local_start"],
                      state["c13"], state["s13"], state["gs13"], state["c2"], state["s2"], state["gs2"],
-                     state["onepw"], act, ybuf, ssq, state["meta"], routes, state["grid"], out)
+                     state["norm_w"], act, ybuf, ssq, state["meta"], routes, state["grid"], out)
     return out
