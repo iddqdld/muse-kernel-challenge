@@ -168,7 +168,7 @@ __device__ __forceinline__ void mma_bf16(float* c, int a0, int a1, int a2, int a
 template <int RT, int MT, int U, bool OUT_F32>
 __global__ void __launch_bounds__(256) skinny_mma_kernel(
         const __nv_bfloat16* __restrict__ x, const int4* __restrict__ w,
-        void* __restrict__ out, int M, int N, int KX, int KW, int k_cta) {
+        void* __restrict__ out, int M, int N, int KX, int KW, int k_cta, int LDO) {
     constexpr int E = RT * MT * 4 * 32;  // accumulator floats per warp
     __shared__ float red[4][E];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
@@ -273,39 +273,40 @@ __global__ void __launch_bounds__(256) skinny_mma_kernel(
         const int row = row0 + rt * 16 + (ln >> 2) + (j >= 2 ? 8 : 0);
         const int tok = nt * 8 + 2 * (ln & 3) + (j & 1);
         if (tok < M) {
-            if (OUT_F32) reinterpret_cast<float*>(out)[(size_t)tok * N + row] = red[0][e];
-            else reinterpret_cast<__nv_bfloat16*>(out)[(size_t)tok * N + row] = __float2bfloat16(red[0][e]);
+            if (OUT_F32) reinterpret_cast<float*>(out)[(size_t)tok * LDO + row] = red[0][e];
+            else reinterpret_cast<__nv_bfloat16*>(out)[(size_t)tok * LDO + row] = __float2bfloat16(red[0][e]);
         }
     }
 }
 
 template <int RT, int MT, int U>
 static cudaError_t launch_rmu(cudaLaunchConfig_t* cfg, bool f32, const __nv_bfloat16* x,
-                              const int4* w, void* out, int M, int N, int KX, int KW, int k_cta) {
-    if (f32) return cudaLaunchKernelEx(cfg, skinny_mma_kernel<RT, MT, U, true>, x, w, out, M, N, KX, KW, k_cta);
-    return cudaLaunchKernelEx(cfg, skinny_mma_kernel<RT, MT, U, false>, x, w, out, M, N, KX, KW, k_cta);
+                              const int4* w, void* out, int M, int N, int KX, int KW, int k_cta, int LDO) {
+    if (f32) return cudaLaunchKernelEx(cfg, skinny_mma_kernel<RT, MT, U, true>, x, w, out, M, N, KX, KW, k_cta, LDO);
+    return cudaLaunchKernelEx(cfg, skinny_mma_kernel<RT, MT, U, false>, x, w, out, M, N, KX, KW, k_cta, LDO);
 }
 
 template <int RT, int MT>
 static cudaError_t launch_rm(cudaLaunchConfig_t* cfg, int u, bool f32, const __nv_bfloat16* x,
-                             const int4* w, void* out, int M, int N, int KX, int KW, int k_cta) {
+                             const int4* w, void* out, int M, int N, int KX, int KW, int k_cta, int LDO) {
     if constexpr (RT <= 2) {  // RT 4 with U 8 would hold 256 registers of W
-        if (u == 8) return launch_rmu<RT, MT, 8>(cfg, f32, x, w, out, M, N, KX, KW, k_cta);
+        if (u == 8) return launch_rmu<RT, MT, 8>(cfg, f32, x, w, out, M, N, KX, KW, k_cta, LDO);
     }
-    if (u == 2) return launch_rmu<RT, MT, 2>(cfg, f32, x, w, out, M, N, KX, KW, k_cta);
-    return launch_rmu<RT, MT, 4>(cfg, f32, x, w, out, M, N, KX, KW, k_cta);
+    if (u == 2) return launch_rmu<RT, MT, 2>(cfg, f32, x, w, out, M, N, KX, KW, k_cta, LDO);
+    return launch_rmu<RT, MT, 4>(cfg, f32, x, w, out, M, N, KX, KW, k_cta, LDO);
 }
 
 template <int RT>
 static cudaError_t launch_r(cudaLaunchConfig_t* cfg, int mt, int u, bool f32, const __nv_bfloat16* x,
-                            const int4* w, void* out, int M, int N, int KX, int KW, int k_cta) {
-    if (mt == 1) return launch_rm<RT, 1>(cfg, u, f32, x, w, out, M, N, KX, KW, k_cta);
-    if (mt == 2) return launch_rm<RT, 2>(cfg, u, f32, x, w, out, M, N, KX, KW, k_cta);
-    return launch_rm<RT, 4>(cfg, u, f32, x, w, out, M, N, KX, KW, k_cta);
+                            const int4* w, void* out, int M, int N, int KX, int KW, int k_cta, int LDO) {
+    if (mt == 1) return launch_rm<RT, 1>(cfg, u, f32, x, w, out, M, N, KX, KW, k_cta, LDO);
+    if (mt == 2) return launch_rm<RT, 2>(cfg, u, f32, x, w, out, M, N, KX, KW, k_cta, LDO);
+    return launch_rm<RT, 4>(cfg, u, f32, x, w, out, M, N, KX, KW, k_cta, LDO);
 }
 
+// ldo: elements between output rows (N for a contiguous output).
 cudaError_t skinny_mma_launch(const void* x, const void* w, void* out, bool f32, int M, int N, int KX,
-                              int KW, int rt, int u, int ksplit, cudaStream_t stream) {
+                              int KW, int rt, int u, int ksplit, int ldo, cudaStream_t stream) {
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = dim3(N / (16 * rt), ksplit, 1);
     cfg.blockDim = dim3(256, 1, 1);
@@ -321,9 +322,9 @@ cudaError_t skinny_mma_launch(const void* x, const void* w, void* out, bool f32,
     const int k_cta = KW / ksplit;
     auto xp = static_cast<const __nv_bfloat16*>(x);
     auto wp = static_cast<const int4*>(w);
-    if (rt == 4) return launch_r<4>(&cfg, mt, u, f32, xp, wp, out, M, N, KX, KW, k_cta);
-    if (rt == 2) return launch_r<2>(&cfg, mt, u, f32, xp, wp, out, M, N, KX, KW, k_cta);
-    return launch_r<1>(&cfg, mt, u, f32, xp, wp, out, M, N, KX, KW, k_cta);
+    if (rt == 4) return launch_r<4>(&cfg, mt, u, f32, xp, wp, out, M, N, KX, KW, k_cta, ldo);
+    if (rt == 2) return launch_r<2>(&cfg, mt, u, f32, xp, wp, out, M, N, KX, KW, k_cta, ldo);
+    return launch_r<1>(&cfg, mt, u, f32, xp, wp, out, M, N, KX, KW, k_cta, ldo);
 }
 """
 
@@ -332,14 +333,14 @@ BF16_TORCH = r"""
 #include <ATen/cuda/CUDAContext.h>
 
 cudaError_t skinny_mma_launch(const void* x, const void* w, void* out, bool f32, int M, int N, int KX,
-                              int KW, int rt, int u, int ksplit, cudaStream_t stream);
+                              int KW, int rt, int u, int ksplit, int ldo, cudaStream_t stream);
 
 void skinny_mma(torch::Tensor x, torch::Tensor w_packed, torch::Tensor out, int64_t kx, int64_t kw,
                 int64_t rt, int64_t u, int64_t ksplit) {
-    TORCH_CHECK(x.is_contiguous() && w_packed.is_contiguous() && out.is_contiguous());
+    TORCH_CHECK(x.is_contiguous() && w_packed.is_contiguous() && out.stride(1) == 1);
     const cudaError_t err = skinny_mma_launch(
         x.data_ptr(), w_packed.data_ptr(), out.data_ptr(), out.scalar_type() == at::kFloat, x.size(0),
-        out.size(1), kx, kw, rt, u, ksplit, at::cuda::getCurrentCUDAStream());
+        out.size(1), kx, kw, rt, u, ksplit, out.stride(0), at::cuda::getCurrentCUDAStream());
     TORCH_CHECK(err == cudaSuccess, "skinny_mma: ", cudaGetErrorString(err));
 }
 """
@@ -418,17 +419,20 @@ constexpr int MAX_GROUPS = 160;
 constexpr int META_E = 1, META_BEG = 1 + MAX_GROUPS, META_N = 1 + 2 * MAX_GROUPS;
 
 // 1 block, 1024 threads: the local routes (token * 8 + slot) sorted by expert into list, the
-// groups of up to 32 routes per expert into meta, and ssq zeroed.
-__global__ void __launch_bounds__(1024) moe_route_kernel(const int* __restrict__ ids, int n_ids, int local_start,
+// groups of up to 32 routes per expert into meta, and ssq zeroed. A route is local when its
+// expert minus *ls (this GPU's first expert, read on the device) is in 0..31, modulo 256.
+__global__ void __launch_bounds__(1024) moe_route_kernel(const int* __restrict__ ids, int n_ids,
+                                                         const int* __restrict__ ls,
                                                          int* __restrict__ meta, int* __restrict__ list,
                                                          float* __restrict__ ssq) {
     __shared__ int cnt[LOCAL], cur[LOCAL];
+    const int base = *ls;
     if (threadIdx.x < LOCAL) cnt[threadIdx.x] = 0;
     __syncthreads();
     for (int i = threadIdx.x; i < n_ids; i += blockDim.x) {
         ssq[i] = 0.f;
-        const int e = ids[i] - local_start;
-        if (e >= 0 && e < LOCAL) atomicAdd(&cnt[e], 1);
+        const int e = (ids[i] - base) & 255;
+        if (e < LOCAL) atomicAdd(&cnt[e], 1);
     }
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -446,8 +450,8 @@ __global__ void __launch_bounds__(1024) moe_route_kernel(const int* __restrict__
     }
     __syncthreads();
     for (int i = threadIdx.x; i < n_ids; i += blockDim.x) {
-        const int e = ids[i] - local_start;
-        if (e >= 0 && e < LOCAL) list[atomicAdd(&cur[e], 1)] = i;
+        const int e = (ids[i] - base) & 255;
+        if (e < LOCAL) list[atomicAdd(&cur[e], 1)] = i;
     }
 }
 
@@ -578,7 +582,7 @@ __device__ __forceinline__ void down_item(const __nv_bfloat16* __restrict__ act,
 // Persistent: blocks walk the items (group, 16-row tile). 256 threads, 2 blocks per SM.
 __global__ void __launch_bounds__(256, 2) moe_up_kernel(
         const __nv_bfloat16* __restrict__ x, const int* __restrict__ meta, const int* __restrict__ list,
-        int local_start, const int4* __restrict__ codes, const int4* __restrict__ scales,
+        const int4* __restrict__ codes, const int4* __restrict__ scales,
         const float* __restrict__ gs, __nv_bfloat16* __restrict__ act) {
     __shared__ float red[8 * 4 * 128];
     const int items = meta[0] * (I / 16);
@@ -586,7 +590,7 @@ __global__ void __launch_bounds__(256, 2) moe_up_kernel(
         const int grp = item / (I / 16), tile = item % (I / 16);
         const int e = meta[META_E + grp], n = meta[META_N + grp];
         const int* routes = list + meta[META_BEG + grp];
-        const float gsc = gs[local_start + e] * 256.f;
+        const float gsc = gs[e] * 256.f;  // the global scales of the 32 local experts
         if (n <= 8) up_item<1>(x, routes, n, e, tile, codes, scales, gsc, act, red);
         else if (n <= 16) up_item<2>(x, routes, n, e, tile, codes, scales, gsc, act, red);
         else up_item<4>(x, routes, n, e, tile, codes, scales, gsc, act, red);
@@ -595,7 +599,7 @@ __global__ void __launch_bounds__(256, 2) moe_up_kernel(
 
 __global__ void __launch_bounds__(256, 2) moe_down_kernel(
         const __nv_bfloat16* __restrict__ act, const int* __restrict__ meta, const int* __restrict__ list,
-        int local_start, const int4* __restrict__ codes, const int4* __restrict__ scales,
+        const int4* __restrict__ codes, const int4* __restrict__ scales,
         const float* __restrict__ gs, const __nv_bfloat16* __restrict__ norm_w, __nv_bfloat16* __restrict__ ybuf,
         float* __restrict__ ssq) {
     __shared__ float red[8 * 4 * 128];
@@ -605,7 +609,7 @@ __global__ void __launch_bounds__(256, 2) moe_down_kernel(
         const int grp = item / (H / 16), tile = item % (H / 16);
         const int e = meta[META_E + grp], n = meta[META_N + grp];
         const int* routes = list + meta[META_BEG + grp];
-        const float gsc = gs[local_start + e] * 256.f;
+        const float gsc = gs[e] * 256.f;
         if (n <= 8) down_item<1>(act, routes, n, e, tile, codes, scales, gsc, norm_w, ybuf, ssq, red, sq);
         else if (n <= 16) down_item<2>(act, routes, n, e, tile, codes, scales, gsc, norm_w, ybuf, ssq, red, sq);
         else down_item<4>(act, routes, n, e, tile, codes, scales, gsc, norm_w, ybuf, ssq, red, sq);
@@ -615,7 +619,7 @@ __global__ void __launch_bounds__(256, 2) moe_down_kernel(
 // grid M, 256 threads, 16 columns each:
 // out[t] = sum over local routes of w * y * (1 + post_norm_w) * rsqrt(mean((y * (1 + post_norm_w))^2) + eps).
 __global__ void __launch_bounds__(256) moe_combine_kernel(
-        const int* __restrict__ ids, const float* __restrict__ wts, int local_start,
+        const int* __restrict__ ids, const float* __restrict__ wts, const int* __restrict__ ls,
         const __nv_bfloat16* __restrict__ norm_w,
         const __nv_bfloat16* __restrict__ ybuf, const float* __restrict__ ssq, __nv_bfloat16* __restrict__ out) {
     const int tok = blockIdx.x, c = threadIdx.x * 16;
@@ -623,8 +627,8 @@ __global__ void __launch_bounds__(256) moe_combine_kernel(
 #pragma unroll
     for (int q = 0; q < 16; ++q) nw[q] = 1.f + __bfloat162float(norm_w[c + q]);
     for (int s = 0; s < TOPK; ++s) {
-        const int r = tok * TOPK + s, e = ids[r] - local_start;
-        if (e < 0 || e >= LOCAL) continue;
+        const int r = tok * TOPK + s, e = (ids[r] - *ls) & 255;
+        if (e >= LOCAL) continue;
         const float f = wts[r] * rsqrtf(ssq[r] * (1.f / H) + 1e-8f);
         const int4* y = reinterpret_cast<const int4*>(ybuf + (size_t)r * H + c);
         __align__(16) __nv_bfloat16 v[16];
@@ -641,18 +645,18 @@ __global__ void __launch_bounds__(256) moe_combine_kernel(
     dst[1] = reinterpret_cast<const int4*>(o)[1];
 }
 
-cudaError_t moe_launch(const void* x, const int* ids, const float* wts, int M, int local_start,
+cudaError_t moe_launch(const void* x, const int* ids, const float* wts, int M, const int* ls,
                        const void* c13, const void* s13, const float* gs13, const void* c2, const void* s2,
                        const float* gs2, const void* norm_w, void* act, void* ybuf, float* ssq, int* meta,
                        int* list, int grid, void* out, cudaStream_t st) {
     const int n_ids = M * TOPK;
     if (n_ids > 32 * MAX_GROUPS - 32 * LOCAL) return cudaErrorInvalidValue;  // groups always fit
-    moe_route_kernel<<<1, 1024, 0, st>>>(ids, n_ids, local_start, meta, list, ssq);
-    moe_up_kernel<<<grid, 256, 0, st>>>((const __nv_bfloat16*)x, meta, list, local_start, (const int4*)c13,
+    moe_route_kernel<<<1, 1024, 0, st>>>(ids, n_ids, ls, meta, list, ssq);
+    moe_up_kernel<<<grid, 256, 0, st>>>((const __nv_bfloat16*)x, meta, list, (const int4*)c13,
                                         (const int4*)s13, gs13, (__nv_bfloat16*)act);
-    moe_down_kernel<<<grid, 256, 0, st>>>((const __nv_bfloat16*)act, meta, list, local_start, (const int4*)c2,
+    moe_down_kernel<<<grid, 256, 0, st>>>((const __nv_bfloat16*)act, meta, list, (const int4*)c2,
                                           (const int4*)s2, gs2, (const __nv_bfloat16*)norm_w, (__nv_bfloat16*)ybuf, ssq);
-    moe_combine_kernel<<<M, 256, 0, st>>>(ids, wts, local_start, (const __nv_bfloat16*)norm_w,
+    moe_combine_kernel<<<M, 256, 0, st>>>(ids, wts, ls, (const __nv_bfloat16*)norm_w,
                                           (const __nv_bfloat16*)ybuf, ssq,
                                           (__nv_bfloat16*)out);
     return cudaGetLastError();
@@ -663,17 +667,18 @@ MOE_TORCH = r"""
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 
-cudaError_t moe_launch(const void* x, const int* ids, const float* wts, int M, int local_start,
+cudaError_t moe_launch(const void* x, const int* ids, const float* wts, int M, const int* ls,
                        const void* c13, const void* s13, const float* gs13, const void* c2, const void* s2,
                        const float* gs2, const void* norm_w, void* act, void* ybuf, float* ssq, int* meta,
                        int* list, int grid, void* out, cudaStream_t st);
 
-void moe_forward(torch::Tensor x, torch::Tensor ids, torch::Tensor wts, int64_t local_start,
+void moe_forward(torch::Tensor x, torch::Tensor ids, torch::Tensor wts, torch::Tensor local_start,
                  torch::Tensor c13, torch::Tensor s13, torch::Tensor gs13, torch::Tensor c2, torch::Tensor s2,
                  torch::Tensor gs2, torch::Tensor norm_w, torch::Tensor act, torch::Tensor ybuf, torch::Tensor ssq,
                  torch::Tensor meta, torch::Tensor list, int64_t grid, torch::Tensor out) {
     const cudaError_t err = moe_launch(
-        x.data_ptr(), ids.data_ptr<int>(), wts.data_ptr<float>(), x.size(0), local_start, c13.data_ptr(),
+        x.data_ptr(), ids.data_ptr<int>(), wts.data_ptr<float>(), x.size(0), local_start.data_ptr<int>(),
+        c13.data_ptr(),
         s13.data_ptr(), gs13.data_ptr<float>(), c2.data_ptr(), s2.data_ptr(), gs2.data_ptr<float>(),
         norm_w.data_ptr(), act.data_ptr(), ybuf.data_ptr(), ssq.data_ptr<float>(),
         meta.data_ptr<int>(), list.data_ptr<int>(), grid, out.data_ptr(), at::cuda::getCurrentCUDAStream());
@@ -682,7 +687,7 @@ void moe_forward(torch::Tensor x, torch::Tensor ids, torch::Tensor wts, int64_t 
 """
 
 MOE_DECLS = """
-void moe_forward(torch::Tensor x, torch::Tensor ids, torch::Tensor wts, int64_t local_start,
+void moe_forward(torch::Tensor x, torch::Tensor ids, torch::Tensor wts, torch::Tensor local_start,
                  torch::Tensor c13, torch::Tensor s13, torch::Tensor gs13, torch::Tensor c2, torch::Tensor s2,
                  torch::Tensor gs2, torch::Tensor norm_w, torch::Tensor act, torch::Tensor ybuf, torch::Tensor ssq,
                  torch::Tensor meta, torch::Tensor list, int64_t grid, torch::Tensor out);
@@ -731,10 +736,10 @@ def _compile():
     from torch.utils.cpp_extension import load_inline
     t0 = time.time()
     if _BF16 is None:
-        _BF16 = load_inline(name="muse_dl_gemv_v1", cpp_sources=BF16_DECLS, cuda_sources=BF16_CUDA + BF16_TORCH,
+        _BF16 = load_inline(name="muse_dl_gemv_v2", cpp_sources=BF16_DECLS, cuda_sources=BF16_CUDA + BF16_TORCH,
                             functions=["skinny_mma"], extra_cuda_cflags=["-O3"], verbose=False)
     if _MOE is None:
-        _MOE = load_inline(name="muse_dl_moe_v1", cpp_sources=MOE_DECLS, cuda_sources=MOE_CUDA + MOE_TORCH,
+        _MOE = load_inline(name="muse_dl_moe_v2", cpp_sources=MOE_DECLS, cuda_sources=MOE_CUDA + MOE_TORCH,
                            functions=["moe_forward"], extra_cuda_cflags=["-O3"], verbose=False)
     print(f"CUDA compiled in {time.time() - t0:.0f}s", flush=True)
 
@@ -777,9 +782,9 @@ def _router_split(x, state):
     return out
 
 
-def _experts(x, topk_weights, local_ids, state):
-    """Our NVFP4 MoE kernels: x bf16 [T, 4096], local expert ids 0-31 (others elsewhere) ->
-    the post-expert-normed, weighted sum per token, bf16 [T, 4096]."""
+def _experts(x, topk_weights, topk_ids, local_start, state):
+    """Our NVFP4 MoE kernels: x bf16 [T, 4096], global expert ids, this GPU's first expert as an
+    int32 [1] tensor (read on the device) -> the post-expert-normed, weighted sum, bf16 [T, 4096]."""
     moe = state["moe"]
     m = x.shape[0]
     dev = x.device
@@ -788,9 +793,9 @@ def _experts(x, topk_weights, local_ids, state):
     ybuf = torch.empty((m * TOP_K, D_EXPERT), device=dev, dtype=torch.bfloat16)
     ssq = torch.empty((m * TOP_K,), device=dev, dtype=torch.float32)
     routes = torch.empty((m * TOP_K,), device=dev, dtype=torch.int32)
-    _MOE.moe_forward(x.contiguous(), local_ids, topk_weights.to(torch.float32).contiguous(), 0,
-                     moe["c13"], moe["s13"], moe["gs13"], moe["c2"], moe["s2"], moe["gs2"], moe["norm_w"],
-                     act, ybuf, ssq, moe["meta"], routes, moe["grid"], out)
+    _MOE.moe_forward(x.contiguous(), topk_ids.contiguous(), topk_weights.to(torch.float32).contiguous(),
+                     local_start, moe["c13"], moe["s13"], moe["gs13"], moe["c2"], moe["s2"], moe["gs2"],
+                     moe["norm_w"], act, ybuf, ssq, moe["meta"], routes, moe["grid"], out)
     return out
 
 
@@ -834,6 +839,9 @@ def prepare(weights):
             "grid": 2 * torch.cuda.get_device_properties(device).multi_processor_count,
         },
         "side_stream": torch.cuda.Stream(device),
+        # Up to 8 tokens the unpooler fills only this GPU's 1024 columns; the other columns of this
+        # buffer stay zero (the all-gather's zero pad), so no pad kernel runs.
+        "unpool_buf": torch.zeros((SLICED_UNPOOL_MAX_TOKENS, HIDDEN), device=device, dtype=torch.bfloat16),
         "_modules": (pre_ffn, next_pre_attn, post_attn, post_ffn),
     }
     del freqs
@@ -902,11 +910,14 @@ def kernel_fn(data, state):
     if not torch.cuda.is_current_stream_capturing():
         for tensor in (topk_weights, topk_ids):
             tensor.record_stream(main_stream)
-    # This GPU's experts start at local_start: as SGLang's expert_map on that EP rank.
-    local_ids = ((topk_ids - data["local_start"]) % N_EXPERTS).to(torch.int32).contiguous()
-    # all-reduce: identity
-    expert_output = _experts(state["pre_expert_norm"](expert_input), topk_weights, local_ids, state)
-    if tokens <= SLICED_UNPOOL_MAX_TOKENS:
+    # all-reduce: identity. The MoE kernels map experts to this GPU's 32 (local_start) themselves.
+    expert_output = _experts(state["pre_expert_norm"](expert_input), topk_weights, topk_ids, data["local_start"], state)
+    cfg_unpool = GEMV_PLAN.get(("unpooler", next((b for b in BUCKETS if b >= tokens), 0)))
+    if tokens <= SLICED_UNPOOL_MAX_TOKENS and cfg_unpool:
+        ffn_output = state["unpool_buf"][:tokens]  # all-gather: identity
+        _BF16.skinny_mma(expert_output, state["packed"]["unpooler"], ffn_output[:, :UNPOOL_SLICE],
+                         D_EXPERT, D_EXPERT, *cfg_unpool)
+    elif tokens <= SLICED_UNPOOL_MAX_TOKENS:
         unpooled = _gemv(expert_output, state, "unpooler", UNPOOL_SLICE)
         ffn_output = F.pad(unpooled, (0, HIDDEN - UNPOOL_SLICE))  # all-gather: identity
     else:
