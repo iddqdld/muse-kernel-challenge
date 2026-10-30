@@ -32,7 +32,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-BENCH = True
+BENCH = False
 
 
 class Weights(TypedDict):
@@ -349,12 +349,17 @@ BUCKETS = (1, 8, 16, 32, 128, 256)  # the scored token counts
 LAYER_NAMES = ("qkv_gate", "o", "pooler", "unpooler", "router")
 
 # (layer, bucket) -> ("cuda", (rt, u, ksplit)), ("triton", (bm, bn, bk, split, warps, stages))
-# or ("torch", None). Filled from BENCH runs.
-PLAN = {  # check 9f324e1a: CUDA GEMV where it beats cuBLAS; cuBLAS elsewhere
+# or ("torch", None) for SGLang's own dispatch. Filled from BENCH runs.
+PLAN = {  # check 67996f44: CUDA GEMV on packed weights where it wins
     **{(layer, m): ("torch", None) for layer in LAYER_NAMES for m in BUCKETS},
     ("qkv_gate", 1): ("cuda", (1, 8, 2)),
-    ("qkv_gate", 8): ("cuda", (1, 4, 4)),
-    ("unpooler", 1): ("cuda", (2, 2, 8)),
+    ("qkv_gate", 8): ("cuda", (1, 8, 2)),
+    ("qkv_gate", 16): ("cuda", (2, 2, 4)),
+    ("o", 1): ("cuda", (1, 4, 1)),
+    ("pooler", 1): ("cuda", (1, 8, 2)),
+    ("pooler", 8): ("cuda", (1, 8, 2)),
+    ("pooler", 16): ("cuda", (2, 8, 2)),
+    ("unpooler", 1): ("cuda", (1, 4, 4)),
     ("unpooler", 8): ("cuda", (1, 4, 4)),
     **{("router", m): ("cuda", (1, 8, 8)) for m in (1, 8, 16, 32)},
 }
@@ -413,7 +418,8 @@ def _torch(x, state, layer, n):
         acc = torch.mm(x, state["router_hi_t"], out_dtype=torch.float32)
         acc += torch.mm(x, state["router_lo_t"], out_dtype=torch.float32)
         return acc
-    return x @ state[layer][:n].T
+    from sglang.srt.layers.quantization.unquant import _bf16_gemm_dispatch_impl
+    return _bf16_gemm_dispatch_impl(x, state[layer][:n], None)  # SGLang's own pick: never slower
 
 
 def _run(kind, cfg, x, state, layer, n):
