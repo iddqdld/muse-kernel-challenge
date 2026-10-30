@@ -129,12 +129,13 @@ constexpr int NQ = NCH / 4;  // chunks per warp: every warp takes a quarter of K
 struct Routing {  // shared memory
     int ng;
     int ge[MAX_GROUPS], gbeg[MAX_GROUPS], gn[MAX_GROUPS];
-    int cnt[LOCAL], cur[LOCAL];
-    int list[MAX_IDS];  // local routes (token * 8 + slot), sorted by expert
+    int cnt[LOCAL], cur[LOCAL], wcnt[8][LOCAL];
+    int list[MAX_IDS];  // local routes (token * 8 + slot), sorted by expert, then by route
 };
 
 // Every block of the up kernel builds the routing itself (no extra launch); block 0 publishes
-// it for the down kernel and zeroes ssq.
+// it for the down kernel and zeroes ssq. The list must be identical in every block (a group is
+// a slice of it), so the scatter keeps route order instead of using atomic slots.
 __device__ void build_routing(const int* __restrict__ ids, int n_ids, int local_start, Routing& r,
                               int* __restrict__ meta, int* __restrict__ list, float* __restrict__ ssq) {
     if (threadIdx.x < LOCAL) r.cnt[threadIdx.x] = 0;
@@ -158,11 +159,30 @@ __device__ void build_routing(const int* __restrict__ ids, int n_ids, int local_
         r.ng = ng;
     }
     __syncthreads();
-    for (int i = threadIdx.x; i < n_ids; i += blockDim.x) {
-        const int e = ids[i] - local_start;
-        if (e >= 0 && e < LOCAL) r.list[atomicAdd(&r.cur[e], 1)] = i;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    for (int b0 = 0; b0 < n_ids; b0 += blockDim.x) {  // 256 ids per round, in order
+        const int i = b0 + threadIdx.x;
+        int e = i < n_ids ? ids[i] - local_start : -1;
+        if (e < 0 || e >= LOCAL) e = -1;
+        r.wcnt[warp][lane] = 0;
+        __syncthreads();
+        const unsigned same = __match_any_sync(0xffffffffu, e);
+        const int rank = __popc(same & ((1u << lane) - 1));
+        if (e >= 0 && rank == 0) r.wcnt[warp][e] = __popc(same);
+        __syncthreads();
+        if (e >= 0) {
+            int pos = r.cur[e] + rank;
+            for (int w = 0; w < warp; ++w) pos += r.wcnt[w][e];
+            r.list[pos] = i;
+        }
+        __syncthreads();
+        if (threadIdx.x < LOCAL) {
+            int s = 0;
+            for (int w = 0; w < 8; ++w) s += r.wcnt[w][threadIdx.x];
+            r.cur[threadIdx.x] += s;
+        }
+        __syncthreads();
     }
-    __syncthreads();
     if (blockIdx.x == 0) {
         for (int i = threadIdx.x; i < n_ids; i += blockDim.x) {
             list[i] = r.list[i];
