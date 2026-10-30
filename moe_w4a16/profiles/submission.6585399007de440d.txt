@@ -1,0 +1,59 @@
+okc run 6585399007de440d on muse_moe_w4a16
+submission  /home/iddqdld/muse/moe_w4a16/submission.py
+status      ok
+passed      true
+speedup     1.2425651611765185
+speedup_ci  [1.2181355630109632 1.2660554452805801]
+score_us    10823.17484844524
+tests       5/5 passed
+
+scored shapes (µs; speed of light is the reference's bound)
+case                                                         sglang      yours  speedup        sol  
+bs=1 load=decode 1 sharding=ep8                               76.98      72.40   1.063x      11.42  
+bs=16 load=decode 16 sharding=ep8                            191.78     140.40   1.366x      52.52  
+bs=32 load=decode 32 sharding=ep8                            213.79     181.37   1.179x      70.76  
+bs=8 load=verify 1 sharding=ep8                              143.01     106.98   1.337x      37.32  
+bs=128 load=verify 16 sharding=ep8                           463.92     341.50   1.358x     101.34  
+bs=256 load=verify 32 sharding=ep8                           620.48     524.11   1.184x     108.94  
+
+profile 0: bs=1 load=decode 1 sharding=ep8
+kernel                                                           GPU time  share  calls
+moe_up_kernel(__nv_bfloat16 const*, int const*, int, int,...      39.4 µs  52.4%      1
+moe_down_kernel(__nv_bfloat16 const*, int const*, int, in...      33.4 µs  44.4%      1
+moe_combine_kernel(int const*, float const*, int, float c...       2.5 µs   3.3%      1
+total                                                             75.3 µs
+
+profile 1: bs=16 load=decode 16 sharding=ep8
+kernel                                                           GPU time  share  calls
+moe_up_kernel(__nv_bfloat16 const*, int const*, int, int,...      74.7 µs  65.4%      1
+moe_down_kernel(__nv_bfloat16 const*, int const*, int, in...      37.2 µs  32.5%      1
+moe_combine_kernel(int const*, float const*, int, float c...       2.3 µs   2.0%      1
+total                                                            114.1 µs
+
+profile 2: bs=32 load=decode 32 sharding=ep8
+kernel                                                           GPU time  share  calls
+moe_up_kernel(__nv_bfloat16 const*, int const*, int, int,...      80.0 µs  61.2%      1
+moe_down_kernel(__nv_bfloat16 const*, int const*, int, in...      48.2 µs  36.9%      1
+moe_combine_kernel(int const*, float const*, int, float c...       2.4 µs   1.9%      1
+total                                                            130.6 µs
+
+profile 3: bs=8 load=verify 1 sharding=ep8
+kernel                                                           GPU time  share  calls
+moe_up_kernel(__nv_bfloat16 const*, int const*, int, int,...      65.3 µs  63.6%      1
+moe_down_kernel(__nv_bfloat16 const*, int const*, int, in...      35.2 µs  34.2%      1
+moe_combine_kernel(int const*, float const*, int, float c...       2.2 µs   2.2%      1
+total                                                            102.8 µs
+
+profile 4: bs=128 load=verify 16 sharding=ep8
+kernel                                                           GPU time  share  calls
+moe_up_kernel(__nv_bfloat16 const*, int const*, int, int,...     162.9 µs  63.5%      1
+moe_down_kernel(__nv_bfloat16 const*, int const*, int, in...      90.8 µs  35.4%      1
+moe_combine_kernel(int const*, float const*, int, float c...       2.8 µs   1.1%      1
+total                                                            256.5 µs
+
+profile 5: bs=256 load=verify 32 sharding=ep8
+kernel                                                           GPU time  share  calls
+moe_up_kernel(__nv_bfloat16 const*, int const*, int, int,...     307.2 µs  56.7%      1
+moe_down_kernel(__nv_bfloat16 const*, int const*, int, in...     230.8 µs  42.6%      1
+moe_combine_kernel(int const*, float const*, int, float c...       3.8 µs   0.7%      1
+total                                                            541.9 µs
