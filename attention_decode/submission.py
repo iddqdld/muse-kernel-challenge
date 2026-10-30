@@ -26,6 +26,9 @@ import triton.language as tl
 FP8 = torch.float8_e4m3fn
 RMS_EPS = 1e-5
 NEG = -1.0e38
+# Kernel-side constants must be triton constexpr globals, not plain Python ones.
+EPS_C = tl.constexpr(1e-5)
+NEG_C = tl.constexpr(-1.0e38)
 
 
 class Config(TypedDict):
@@ -65,7 +68,7 @@ class Inputs(TypedDict):
 def _attn_kernel(
     QKV, CLOC, SEQLEN, KC, VC, PT, KSC, VSC, INVF, ACC, PM, PL,
     stride_pt,
-    B: tl.constexpr, L: tl.constexpr, HQ: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr,
+    L: tl.constexpr, HQ: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr,
     SM: tl.constexpr, QKSCALE: tl.constexpr, WINDOW: tl.constexpr, ROPE: tl.constexpr,
     PAGE: tl.constexpr, NCHUNK: tl.constexpr, CHUNK: tl.constexpr,
     BM: tl.constexpr, BN: tl.constexpr, BP: tl.constexpr,
@@ -103,7 +106,7 @@ def _attn_kernel(
     qoff = tok * ((2 * HQ + 2 * HKV) * D) + kvh * group * D + hr * D
     qt = tl.load(QKV + qoff[:, None] + d[None, :], mask=rok[:, None], other=0.0)
     qf = qt.to(tl.float32)
-    qf = qf * tl.rsqrt(tl.sum(qf * qf, 1) / D + RMS_EPS)[:, None] * QKSCALE
+    qf = qf * tl.rsqrt(tl.sum(qf * qf, 1) / D + EPS_C)[:, None] * QKSCALE
     if ROPE:
         ang = (seq + jr).to(tl.float32)[:, None] * tl.load(INVF + tl.arange(0, D // 2))[None, :]
         cs = tl.cos(ang)
@@ -120,7 +123,7 @@ def _attn_kernel(
     voff = koff + HKV * D
     kn = tl.load(QKV + koff[:, None] + d[None, :], mask=rmk[:, None], other=0.0).to(tl.float32)
     vn = tl.load(QKV + voff[:, None] + d[None, :], mask=rmk[:, None], other=0.0).to(tl.float32)
-    kn = kn * tl.rsqrt(tl.sum(kn * kn, 1) / D + RMS_EPS)[:, None]
+    kn = kn * tl.rsqrt(tl.sum(kn * kn, 1) / D + EPS_C)[:, None]
     if ROPE:
         ang = (seq + r).to(tl.float32)[:, None] * tl.load(INVF + tl.arange(0, D // 2))[None, :]
         cs = tl.cos(ang)
@@ -139,7 +142,7 @@ def _attn_kernel(
         tl.store(KC + coff[:, None] + d[None, :], kq, mask=rmk[:, None])
         tl.store(VC + coff[:, None] + d[None, :], vq, mask=rmk[:, None])
 
-    m_i = tl.full([BM], NEG, tl.float32)
+    m_i = tl.full([BM], NEG_C, tl.float32)
     l_i = tl.zeros([BM], tl.float32)
     acc = tl.zeros([BM, D], tl.float32)
     pos_row = seq + jr
@@ -168,7 +171,7 @@ def _attn_kernel(
         if WINDOW > 0:
             vis = vis & (t[None, :] > pos_row[:, None] - WINDOW)
         qk = tl.where(vis, qk, float("-inf"))
-        m_new = tl.maximum(tl.maximum(m_i, tl.max(qk, 1)), NEG)
+        m_new = tl.maximum(tl.maximum(m_i, tl.max(qk, 1)), NEG_C)
         alpha = tl.exp(m_i - m_new)
         p = tl.exp(qk - m_new[:, None])
         vv = tl.load(VC + offs, mask=tmk[:, None], other=0.0)
@@ -185,7 +188,7 @@ def _attn_kernel(
         qk = tl.dot(qb, tl.trans(knb)) * SM
         vis = (r[None, :] <= jr[:, None]) & rmk[None, :]
         qk = tl.where(vis, qk, float("-inf"))
-        m_new = tl.maximum(tl.maximum(m_i, tl.max(qk, 1)), NEG)
+        m_new = tl.maximum(tl.maximum(m_i, tl.max(qk, 1)), NEG_C)
         alpha = tl.exp(m_i - m_new)
         p = tl.exp(qk - m_new[:, None])
         l_i = l_i * alpha + tl.sum(p, 1)
@@ -203,7 +206,7 @@ def _attn_kernel(
 @triton.jit
 def _combine_kernel(
     QKV, ACC, PM, PL, OUT,
-    B: tl.constexpr, L: tl.constexpr, HQ: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr,
+    L: tl.constexpr, HQ: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr,
     NCHUNK: tl.constexpr, BC: tl.constexpr,
 ):
     """One (token, query head) per program: merge the chunk partials, RMSNorm, sigmoid gate."""
@@ -215,24 +218,24 @@ def _combine_kernel(
     hrow = (b * L + j) * HQ + h
     mbase = hrow * NCHUNK
 
-    mx = NEG
+    mx = NEG_C
     for c0 in range(0, NCHUNK, BC):
         c = c0 + tl.arange(0, BC)
-        mm = tl.load(PM + mbase + c, mask=c < NCHUNK, other=NEG)
+        mm = tl.load(PM + mbase + c, mask=c < NCHUNK, other=NEG_C)
         mx = tl.maximum(mx, tl.max(mm))
     o = tl.zeros([D], tl.float32)
     ls = 0.0
     for c0 in range(0, NCHUNK, BC):
         c = c0 + tl.arange(0, BC)
         cmk = c < NCHUNK
-        w = tl.exp(tl.load(PM + mbase + c, mask=cmk, other=NEG) - mx)
+        w = tl.exp(tl.load(PM + mbase + c, mask=cmk, other=NEG_C) - mx)
         ll = tl.load(PL + mbase + c, mask=cmk, other=0.0)
         a = tl.load(ACC + hrow * (NCHUNK * D) + c[:, None] * D + d[None, :],
                     mask=cmk[:, None], other=0.0)
         o += tl.sum(a * w[:, None], 0)
         ls += tl.sum(ll * w)
     o = o / ls
-    o = o * tl.rsqrt(tl.sum(o * o) / D + RMS_EPS)
+    o = o * tl.rsqrt(tl.sum(o * o) / D + EPS_C)
     goff = (b * L + j) * ((2 * HQ + 2 * HKV) * D) + (HQ + 2 * HKV) * D + h * D
     o = o * tl.sigmoid(tl.load(QKV + goff + d).to(tl.float32))
     tl.store(OUT + hrow * D + d, o.to(tl.bfloat16))
@@ -299,7 +302,7 @@ def kernel_fn(data: Inputs) -> torch.Tensor:
         data["qkv"], data["cache_loc"], data["seq_lens"], data["k_cache"], data["v_cache"],
         data["page_table"], data["k_scale"], data["v_scale"], invf, acc, pm, pl,
         data["page_table"].stride(0),
-        B=batch, L=length, HQ=hq, HKV=hkv, D=d,
+        L=length, HQ=hq, HKV=hkv, D=d,
         SM=cfg["sm_scale"], QKSCALE=cfg["qk_scale_factor"], WINDOW=cfg["window"],
         ROPE=bool(cfg["rope_theta"]), PAGE=cfg["page_size"], NCHUNK=nchunk, CHUNK=chunk,
         BM=bm, BN=bn, BP=bp,
@@ -308,7 +311,7 @@ def kernel_fn(data: Inputs) -> torch.Tensor:
     )
     _combine_kernel[(batch * length * hq,)](
         data["qkv"], acc, pm, pl, out,
-        B=batch, L=length, HQ=hq, HKV=hkv, D=d, NCHUNK=nchunk, BC=32,
+        L=length, HQ=hq, HKV=hkv, D=d, NCHUNK=nchunk, BC=32,
         num_warps=2,
     )
     return out

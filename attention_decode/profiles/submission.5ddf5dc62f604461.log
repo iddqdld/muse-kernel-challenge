@@ -1,0 +1,217 @@
+ not promise to support this forever.")
+Traceback (most recent call last):
+  File "/tmp/muse_attention_decode-0lt_k7ef/run/worker.py", line 484, in child_main
+    out = kernel()(state.get("data"))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/muse_attention_decode-0lt_k7ef/run/submission.py", line 298, in kernel_fn
+    _attn_kernel[(nchunk, batch, hkv)](
+  File "/opt/sglang/lib/python3.12/site-packages/triton/runtime/jit.py", line 374, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/triton/runtime/jit.py", line 757, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/triton/runtime/jit.py", line 902, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/triton/compiler/compiler.py", line 307, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 42:48:
+        kscale = 1.0
+    if SCALED_V:
+        vscale = tl.load(VSC)
+    else:
+        vscale = 1.0
+
+    # ---- queries: [BM, D] = (token, head) rows for this KV head, normalized and roped
+    tok = b * L + jr
+    qoff = tok * ((2 * HQ + 2 * HKV) * D) + kvh * group * D + hr * D
+    qt = tl.load(QKV + qoff[:, None] + d[None, :], mask=rok[:, None], other=0.0)
+    qf = qt.to(tl.float32)
+    qf = qf * tl.rsqrt(tl.sum(qf * qf, 1) / D + RMS_EPS)[:, None] * QKSCALE
+                                                ^
+NameError("Cannot access global variable RMS_EPS from within @jit'ed function. Triton kernels can only access global variables that are instanstiated as constexpr (`x = triton.language.constexpr(42)`). Note that this is different from annotating a variable as constexpr (`x: triton.language.constexpr = 42`), which is not supported.  Alternatively, set the envvar TRITON_ALLOW_NON_CONSTEXPR_GLOBALS=1, but we do not promise to support this forever.")
+Traceback (most recent call last):
+  File "/tmp/muse_attention_decode-0lt_k7ef/run/worker.py", line 484, in child_main
+    out = kernel()(state.get("data"))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/muse_attention_decode-0lt_k7ef/run/submission.py", line 298, in kernel_fn
+    _attn_kernel[(nchunk, batch, hkv)](
+  File "/opt/sglang/lib/python3.12/site-packages/triton/runtime/jit.py", line 374, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/triton/runtime/jit.py", line 757, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/triton/runtime/jit.py", line 902, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/triton/compiler/compiler.py", line 307, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 42:48:
+        kscale = 1.0
+    if SCALED_V:
+        vscale = tl.load(VSC)
+    else:
+        vscale = 1.0
+
+    # ---- queries: [BM, D] = (token, head) rows for this KV head, normalized and roped
+    tok = b * L + jr
+    qoff = tok * ((2 * HQ + 2 * HKV) * D) + kvh * group * D + hr * D
+    qt = tl.load(QKV + qoff[:, None] + d[None, :], mask=rok[:, None], other=0.0)
+    qf = qt.to(tl.float32)
+    qf = qf * tl.rsqrt(tl.sum(qf * qf, 1) / D + RMS_EPS)[:, None] * QKSCALE
+                                                ^
+NameError("Cannot access global variable RMS_EPS from within @jit'ed function. Triton kernels can only access global variables that are instanstiated as constexpr (`x = triton.language.constexpr(42)`). Note that this is different from annotating a variable as constexpr (`x: triton.language.constexpr = 42`), which is not supported.  Alternatively, set the envvar TRITON_ALLOW_NON_CONSTEXPR_GLOBALS=1, but we do not promise to support this forever.")
+Traceback (most recent call last):
+  File "/tmp/muse_attention_decode-0lt_k7ef/run/worker.py", line 484, in child_main
+    out = kernel()(state.get("data"))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/muse_attention_decode-0lt_k7ef/run/submission.py", line 298, in kernel_fn
+    _attn_kernel[(nchunk, batch, hkv)](
+  File "/opt/sglang/lib/python3.12/site-packages/triton/runtime/jit.py", line 374, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/triton/runtime/jit.py", line 757, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/triton/runtime/jit.py", line 902, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/triton/compiler/compiler.py", line 307, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 42:48:
+        kscale = 1.0
+    if SCALED_V:
+        vscale = tl.load(VSC)
+    else:
+        vscale = 1.0
+
+    # ---- queries: [BM, D] = (token, head) rows for this KV head, normalized and roped
+    tok = b * L + jr
+    qoff = tok * ((2 * HQ + 2 * HKV) * D) + kvh * group * D + hr * D
+    qt = tl.load(QKV + qoff[:, None] + d[None, :], mask=rok[:, None], other=0.0)
+    qf = qt.to(tl.float32)
+    qf = qf * tl.rsqrt(tl.sum(qf * qf, 1) / D + RMS_EPS)[:, None] * QKSCALE
+                                                ^
+NameError("Cannot access global variable RMS_EPS from within @jit'ed function. Triton kernels can only access global variables that are instanstiated as constexpr (`x = triton.language.constexpr(42)`). Note that this is different from annotating a variable as constexpr (`x: triton.language.constexpr = 42`), which is not supported.  Alternatively, set the envvar TRITON_ALLOW_NON_CONSTEXPR_GLOBALS=1, but we do not promise to support this forever.")
+Traceback (most recent call last):
+  File "/tmp/muse_attention_decode-0lt_k7ef/run/worker.py", line 484, in child_main
+    out = kernel()(state.get("data"))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/muse_attention_decode-0lt_k7ef/run/submission.py", line 298, in kernel_fn
+    _attn_kernel[(nchunk, batch, hkv)](
+  File "/opt/sglang/lib/python3.12/site-packages/triton/runtime/jit.py", line 374, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/triton/runtime/jit.py", line 757, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/triton/runtime/jit.py", line 902, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/triton/compiler/compiler.py", line 307, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 42:48:
+        kscale = 1.0
+    if SCALED_V:
+        vscale = tl.load(VSC)
+    else:
+        vscale = 1.0
+
+    # ---- queries: [BM, D] = (token, head) rows for this KV head, normalized and roped
+    tok = b * L + jr
+    qoff = tok * ((2 * HQ + 2 * HKV) * D) + kvh * group * D + hr * D
+    qt = tl.load(QKV + qoff[:, None] + d[None, :], mask=rok[:, None], other=0.0)
+    qf = qt.to(tl.float32)
+    qf = qf * tl.rsqrt(tl.sum(qf * qf, 1) / D + RMS_EPS)[:, None] * QKSCALE
+                                                ^
+NameError("Cannot access global variable RMS_EPS from within @jit'ed function. Triton kernels can only access global variables that are instanstiated as constexpr (`x = triton.language.constexpr(42)`). Note that this is different from annotating a variable as constexpr (`x: triton.language.constexpr = 42`), which is not supported.  Alternatively, set the envvar TRITON_ALLOW_NON_CONSTEXPR_GLOBALS=1, but we do not promise to support this forever.")
+Traceback (most recent call last):
+  File "/tmp/muse_attention_decode-0lt_k7ef/run/worker.py", line 484, in child_main
+    out = kernel()(state.get("data"))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/muse_attention_decode-0lt_k7ef/run/submission.py", line 298, in kernel_fn
+    _attn_kernel[(nchunk, batch, hkv)](
+  File "/opt/sglang/lib/python3.12/site-packages/triton/runtime/jit.py", line 374, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/triton/runtime/jit.py", line 757, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/triton/runtime/jit.py", line 902, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/triton/compiler/compiler.py", line 307, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 42:48:
+        kscale = 1.0
+    if SCALED_V:
+        vscale = tl.load(VSC)
+    else:
+        vscale = 1.0
+
+    # ---- queries: [BM, D] = (token, head) rows for this KV head, normalized and roped
+    tok = b * L + jr
+    qoff = tok * ((2 * HQ + 2 * HKV) * D) + kvh * group * D + hr * D
+    qt = tl.load(QKV + qoff[:, None] + d[None, :], mask=rok[:, None], other=0.0)
+    qf = qt.to(tl.float32)
+    qf = qf * tl.rsqrt(tl.sum(qf * qf, 1) / D + RMS_EPS)[:, None] * QKSCALE
+                                                ^
+NameError("Cannot access global variable RMS_EPS from within @jit'ed function. Triton kernels can only access global variables that are instanstiated as constexpr (`x = triton.language.constexpr(42)`). Note that this is different from annotating a variable as constexpr (`x: triton.language.constexpr = 42`), which is not supported.  Alternatively, set the envvar TRITON_ALLOW_NON_CONSTEXPR_GLOBALS=1, but we do not promise to support this forever.")
+Traceback (most recent call last):
+  File "/tmp/muse_attention_decode-0lt_k7ef/run/worker.py", line 484, in child_main
+    out = kernel()(state.get("data"))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/muse_attention_decode-0lt_k7ef/run/submission.py", line 298, in kernel_fn
+    _attn_kernel[(nchunk, batch, hkv)](
+  File "/opt/sglang/lib/python3.12/site-packages/triton/runtime/jit.py", line 374, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/triton/runtime/jit.py", line 757, in run
+    kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/triton/runtime/jit.py", line 902, in _do_compile
+    kernel = self.compile(src, target=target, options=options.__dict__)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/triton/compiler/compiler.py", line 307, in compile
+    module = src.make_ir(target, options, codegen_fns, module_map, context)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/triton/compiler/compiler.py", line 80, in make_ir
+    return ast_to_ttir(self.fn, self, context=context, options=options, codegen_fns=codegen_fns,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+triton.compiler.errors.CompilationError: at 42:48:
+        kscale = 1.0
+    if SCALED_V:
+        vscale = tl.load(VSC)
+    else:
+        vscale = 1.0
+
+    # ---- queries: [BM, D] = (token, head) rows for this KV head, normalized and roped
+    tok = b * L + jr
+    qoff = tok * ((2 * HQ + 2 * HKV) * D) + kvh * group * D + hr * D
+    qt = tl.load(QKV + qoff[:, None] + d[None, :], mask=rok[:, None], other=0.0)
+    qf = qt.to(tl.float32)
+    qf = qf * tl.rsqrt(tl.sum(qf * qf, 1) / D + RMS_EPS)[:, None] * QKSCALE
+                                                ^
+NameError("Cannot access global variable RMS_EPS from within @jit'ed function. Triton kernels can only access global variables that are instanstiated as constexpr (`x = triton.language.constexpr(42)`). Note that this is different from annotating a variable as constexpr (`x: triton.language.constexpr = 42`), which is not supported.  Alternatively, set the envvar TRITON_ALLOW_NON_CONSTEXPR_GLOBALS=1, but we do not promise to support this forever.")
