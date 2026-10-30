@@ -1,0 +1,229 @@
+okc run 096952eb23ff4331 on muse_decode_layer
+submission  /home/iddqdld/muse/decode_layer/submission.py
+status      ok
+passed      true
+speedup     1.23461872316433
+speedup_ci  [1.216099442316865 1.2531380040117948]
+score_us    18321.688773700214
+tests       13/13 passed
+
+scored shapes (µs; speed of light is the reference's bound)
+case                                                         sglang      yours  speedup        sol  
+batch=1 ctx=80000 dist=soft layer=sliding load=decode 1 page=1     171.02     118.31   1.446x      40.02  
+batch=1 ctx=80000 dist=soft layer=full load=decode 1 page=1     180.48     136.92   1.318x      44.18  
+batch=16 ctx=80000 dist=soft layer=sliding load=decode 16 page=1 spread=agentic     258.32     194.53   1.328x      76.72  
+batch=16 ctx=80000 dist=soft layer=full load=decode 16 page=1 spread=agentic     430.06     379.04   1.135x     137.46  
+batch=32 ctx=80000 dist=soft layer=sliding load=decode 32 page=1 spread=agentic     266.18     239.78   1.110x      84.51  
+batch=32 ctx=80000 dist=soft layer=full load=decode 32 page=1 spread=agentic     614.24     598.93   1.026x     208.10  
+batch=1 ctx=80000 dist=soft layer=sliding load=verify 1 page=1 q_len=8     260.05     218.49   1.190x      62.29  
+batch=1 ctx=80000 dist=soft layer=full load=verify 1 page=1 q_len=8     277.34     235.51   1.178x      66.44  
+batch=16 ctx=80000 dist=soft layer=sliding load=verify 16 page=1 q_len=8 spread=agentic     531.42     420.71   1.263x     126.61  
+batch=16 ctx=80000 dist=soft layer=full load=verify 16 page=1 q_len=8 spread=agentic     697.68     583.69   1.195x     188.68  
+batch=32 ctx=80000 dist=soft layer=sliding load=verify 32 page=1 q_len=8 spread=agentic     753.12     569.92   1.321x     143.81  
+batch=32 ctx=80000 dist=soft layer=full load=verify 32 page=1 q_len=8 spread=agentic    1103.25     924.72   1.193x     267.18  
+
+profile 0: batch=1 ctx=80000 dist=soft layer=sliding load=decode 1 page=1
+kernel                                                           GPU time  share  calls
+void skinny_mma_kernel<1, 1, 8, false>(__nv_bfloat16 cons...      32.0 µs  27.6%      2
+moe_up_kernel(__nv_bfloat16 const*, int const*, int const...      22.0 µs  18.9%      1
+moe_down_kernel(__nv_bfloat16 const*, int const*, int con...      15.7 µs  13.5%      1
+void skinny_mma_kernel<1, 1, 4, false>(__nv_bfloat16 cons...      12.0 µs  10.3%      2
+_attn_kernel                                                       7.0 µs   6.0%      1
+void at::native::(anonymous namespace)::vectorized_layer_...       4.3 µs   3.7%      1
+void dot_kernel<float, 128, 0, cublasDotParams<cublasGemv...       4.1 µs   3.5%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 256, ...       3.9 µs   3.4%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 256, ...       3.8 µs   3.3%      1
+moe_combine_kernel(int const*, float const*, int const*, ...       2.8 µs   2.4%      1
+moe_route_kernel(int const*, int, int const*, int*, int*,...       2.8 µs   2.4%      1
+void sglang::muse_spark::routing_kernel<sglang::muse_spar...       2.6 µs   2.2%      1
+... 2 more
+total                                                            116.0 µs
+
+profile 1: batch=1 ctx=80000 dist=soft layer=full load=decode 1 page=1
+kernel                                                           GPU time  share  calls
+void skinny_mma_kernel<1, 1, 8, false>(__nv_bfloat16 cons...      31.7 µs  23.5%      2
+moe_up_kernel(__nv_bfloat16 const*, int const*, int const...      22.4 µs  16.6%      1
+void cutlass::device_kernel<flash::enable_sm90_or_later<f...      16.4 µs  12.2%      1
+void skinny_mma_kernel<1, 1, 4, false>(__nv_bfloat16 cons...      11.8 µs   8.8%      2
+moe_down_kernel(__nv_bfloat16 const*, int const*, int con...      11.8 µs   8.7%      1
+void cutlass::device_kernel<flash::FlashAttnFwdCombine<cu...       6.7 µs   5.0%      1
+void at::native::(anonymous namespace)::vectorized_layer_...       5.8 µs   4.3%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 256, ...       4.7 µs   3.5%      1
+void dot_kernel<float, 128, 0, cublasDotParams<cublasGemv...       4.3 µs   3.2%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 256, ...       3.4 µs   2.5%      1
+void at::native::vectorized_elementwise_kernel<8, at::nat...       2.9 µs   2.2%      3
+moe_route_kernel(int const*, int, int const*, int*, int*,...       2.8 µs   2.1%      1
+... 6 more
+total                                                            134.7 µs
+
+profile 2: batch=16 ctx=80000 dist=soft layer=sliding load=decode 16 page=1 spread=agentic
+kernel                                                           GPU time  share  calls
+moe_up_kernel(__nv_bfloat16 const*, int const*, int const...      48.2 µs  26.6%      1
+moe_down_kernel(__nv_bfloat16 const*, int const*, int con...      30.4 µs  16.8%      1
+nvjet_sm90_tst_64x16_64x16_2x1_v_bz_TNT                           26.1 µs  14.4%      2
+void skinny_mma_kernel<2, 2, 8, false>(__nv_bfloat16 cons...      20.1 µs  11.1%      1
+void skinny_mma_kernel<2, 2, 2, false>(__nv_bfloat16 cons...      13.7 µs   7.5%      1
+_attn_kernel                                                      11.6 µs   6.4%      1
+void skinny_mma_kernel<1, 2, 8, true>(__nv_bfloat16 const...       7.4 µs   4.1%      1
+void at::native::(anonymous namespace)::vectorized_layer_...       5.6 µs   3.1%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 256, ...       4.0 µs   2.2%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 256, ...       3.6 µs   2.0%      1
+moe_route_kernel(int const*, int, int const*, int*, int*,...       3.1 µs   1.7%      1
+moe_combine_kernel(int const*, float const*, int const*, ...       2.8 µs   1.5%      1
+... 2 more
+total                                                            181.0 µs
+
+profile 3: batch=16 ctx=80000 dist=soft layer=full load=decode 16 page=1 spread=agentic
+kernel                                                           GPU time  share  calls
+void cutlass::device_kernel<flash::enable_sm90_or_later<f...     193.9 µs  50.7%      1
+moe_up_kernel(__nv_bfloat16 const*, int const*, int const...      54.1 µs  14.1%      1
+moe_down_kernel(__nv_bfloat16 const*, int const*, int con...      34.3 µs   9.0%      1
+nvjet_sm90_tst_64x16_64x16_2x1_v_bz_TNT                           26.1 µs   6.8%      2
+void skinny_mma_kernel<2, 2, 8, false>(__nv_bfloat16 cons...      19.7 µs   5.2%      1
+void skinny_mma_kernel<2, 2, 2, false>(__nv_bfloat16 cons...      13.6 µs   3.6%      1
+void skinny_mma_kernel<1, 2, 8, true>(__nv_bfloat16 const...       7.4 µs   1.9%      1
+void at::native::(anonymous namespace)::vectorized_layer_...       5.7 µs   1.5%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 256, ...       4.1 µs   1.1%      1
+void cutlass::device_kernel<flash::FlashAttnFwdCombine<cu...       3.6 µs   0.9%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 256, ...       3.5 µs   0.9%      1
+moe_route_kernel(int const*, int, int const*, int*, int*,...       2.9 µs   0.8%      1
+... 7 more
+total                                                            382.6 µs
+
+profile 4: batch=32 ctx=80000 dist=soft layer=sliding load=decode 32 page=1 spread=agentic
+kernel                                                           GPU time  share  calls
+moe_up_kernel(__nv_bfloat16 const*, int const*, int const...      77.4 µs  31.8%      1
+moe_down_kernel(__nv_bfloat16 const*, int const*, int con...      52.3 µs  21.5%      1
+nvjet_sm90_tst_64x32_64x16_2x1_v_bz_TNT                           26.4 µs  10.8%      2
+nvjet_sm90_tst_128x32_64x10_4x1_v_bz_splitK_TNT                   20.9 µs   8.6%      1
+_attn_kernel                                                      17.3 µs   7.1%      1
+nvjet_sm90_tst_64x32_64x16_4x1_v_bz_splitK_TNT                    12.7 µs   5.2%      1
+void skinny_mma_kernel<1, 4, 8, true>(__nv_bfloat16 const...       8.4 µs   3.4%      1
+void at::native::(anonymous namespace)::vectorized_layer_...       5.7 µs   2.3%      1
+void cublasLt::splitKreduce_kernel<32, 16, int, float, __...       4.1 µs   1.7%      2
+void sglang::muse_spark_norm_residual_kernel<8192l, 256, ...       4.0 µs   1.6%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 256, ...       3.8 µs   1.6%      1
+moe_combine_kernel(int const*, float const*, int const*, ...       3.0 µs   1.2%      1
+... 3 more
+total                                                            243.4 µs
+
+profile 5: batch=32 ctx=80000 dist=soft layer=full load=decode 32 page=1 spread=agentic
+kernel                                                           GPU time  share  calls
+void cutlass::device_kernel<flash::enable_sm90_or_later<f...     368.4 µs  64.1%      1
+moe_up_kernel(__nv_bfloat16 const*, int const*, int const...      59.6 µs  10.4%      1
+moe_down_kernel(__nv_bfloat16 const*, int const*, int con...      38.2 µs   6.7%      1
+nvjet_sm90_tst_64x32_64x16_2x1_v_bz_TNT                           26.9 µs   4.7%      2
+nvjet_sm90_tst_128x32_64x10_4x1_v_bz_splitK_TNT                   21.9 µs   3.8%      1
+nvjet_sm90_tst_64x32_64x16_4x1_v_bz_splitK_TNT                    12.7 µs   2.2%      1
+void skinny_mma_kernel<1, 4, 8, true>(__nv_bfloat16 const...       8.6 µs   1.5%      1
+void at::native::(anonymous namespace)::vectorized_layer_...       5.4 µs   0.9%      1
+void cublasLt::splitKreduce_kernel<32, 16, int, float, __...       4.4 µs   0.8%      2
+void sglang::muse_spark_norm_residual_kernel<8192l, 256, ...       3.9 µs   0.7%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 256, ...       3.9 µs   0.7%      1
+void cutlass::device_kernel<flash::FlashAttnFwdCombine<cu...       3.3 µs   0.6%      1
+... 8 more
+total                                                            574.9 µs
+
+profile 6: batch=1 ctx=80000 dist=soft layer=sliding load=verify 1 page=1 q_len=8
+kernel                                                           GPU time  share  calls
+moe_up_kernel(__nv_bfloat16 const*, int const*, int const...      54.4 µs  27.2%      1
+moe_down_kernel(__nv_bfloat16 const*, int const*, int con...      38.1 µs  19.0%      1
+void skinny_mma_kernel<1, 1, 8, false>(__nv_bfloat16 cons...      33.0 µs  16.5%      2
+sm80_xmma_gemm_f32f32_f32f32_f32_tn_n_tilesize32x32x8_sta...      10.3 µs   5.1%      1
+void cutlass::device_kernel<flash::enable_sm90_or_later<f...       9.5 µs   4.8%      1
+sm80_xmma_gemm_f32f32_f32f32_f32_tn_n_tilesize32x32x8_sta...       9.4 µs   4.7%      1
+void skinny_mma_kernel<1, 1, 4, false>(__nv_bfloat16 cons...       5.4 µs   2.7%      1
+nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT                             5.2 µs   2.6%      1
+void at::native::(anonymous namespace)::vectorized_layer_...       4.5 µs   2.2%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 256, ...       4.3 µs   2.1%      1
+void cutlass::device_kernel<flash::FlashAttnFwdCombine<cu...       4.0 µs   2.0%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 256, ...       3.9 µs   1.9%      1
+... 9 more
+total                                                            200.2 µs
+
+profile 7: batch=1 ctx=80000 dist=soft layer=full load=verify 1 page=1 q_len=8
+kernel                                                           GPU time  share  calls
+moe_up_kernel(__nv_bfloat16 const*, int const*, int const...      59.2 µs  26.2%      1
+moe_down_kernel(__nv_bfloat16 const*, int const*, int con...      39.0 µs  17.3%      1
+void skinny_mma_kernel<1, 1, 8, false>(__nv_bfloat16 cons...      32.2 µs  14.3%      2
+void cutlass::device_kernel<flash::enable_sm90_or_later<f...      18.8 µs   8.3%      1
+sm80_xmma_gemm_f32f32_f32f32_f32_tn_n_tilesize32x32x8_sta...      12.4 µs   5.5%      1
+sm80_xmma_gemm_f32f32_f32f32_f32_tn_n_tilesize32x32x8_sta...       9.5 µs   4.2%      1
+void cutlass::device_kernel<flash::FlashAttnFwdCombine<cu...       7.6 µs   3.4%      1
+nvjet_sm90_tst_64x8_64x16_2x1_v_bz_TNT                             7.3 µs   3.2%      1
+void at::native::(anonymous namespace)::vectorized_layer_...       6.0 µs   2.6%      1
+void skinny_mma_kernel<1, 1, 4, false>(__nv_bfloat16 cons...       5.5 µs   2.4%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 256, ...       4.5 µs   2.0%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 256, ...       3.8 µs   1.7%      1
+... 9 more
+total                                                            225.5 µs
+
+profile 8: batch=16 ctx=80000 dist=soft layer=sliding load=verify 16 page=1 q_len=8 spread=agentic
+kernel                                                           GPU time  share  calls
+moe_up_kernel(__nv_bfloat16 const*, int const*, int const...     174.4 µs  40.2%      1
+moe_down_kernel(__nv_bfloat16 const*, int const*, int con...     114.9 µs  26.5%      1
+nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT                           29.9 µs   6.9%      2
+nvjet_sm90_tst_64x64_64x13_2x1_v_bz_TNT                           25.5 µs   5.9%      1
+nvjet_sm90_tst_96x64_64x10_4x2_h_bz_splitK_TNN                    15.3 µs   3.5%      1
+void cutlass::device_kernel<flash::enable_sm90_or_later<f...      14.6 µs   3.4%      1
+nvjet_sm90_tss_64x32_64x16_2x4_h_bz_splitK_NNT                    10.7 µs   2.5%      2
+void at::native::(anonymous namespace)::vectorized_layer_...       6.1 µs   1.4%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 256, ...       5.0 µs   1.1%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 256, ...       4.4 µs   1.0%      1
+void cublasLt::splitKreduce_kernel<32, 16, int, float, fl...       4.0 µs   0.9%      2
+void cutlass::device_kernel<flash::FlashAttnFwdCombine<cu...       3.9 µs   0.9%      1
+... 11 more
+total                                                            434.2 µs
+
+profile 9: batch=16 ctx=80000 dist=soft layer=full load=verify 16 page=1 q_len=8 spread=agentic
+kernel                                                           GPU time  share  calls
+void cutlass::device_kernel<flash::enable_sm90_or_later<f...     194.9 µs  31.5%      1
+moe_up_kernel(__nv_bfloat16 const*, int const*, int const...     176.5 µs  28.5%      1
+moe_down_kernel(__nv_bfloat16 const*, int const*, int con...     116.5 µs  18.8%      1
+nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT                           29.2 µs   4.7%      2
+nvjet_sm90_tst_64x64_64x13_2x1_v_bz_TNT                           25.4 µs   4.1%      1
+nvjet_sm90_tst_96x64_64x10_4x2_h_bz_splitK_TNN                    15.2 µs   2.4%      1
+nvjet_sm90_tss_64x32_64x16_2x4_h_bz_splitK_NNT                    10.8 µs   1.7%      2
+void at::native::(anonymous namespace)::vectorized_layer_...       6.2 µs   1.0%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 256, ...       5.1 µs   0.8%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 256, ...       5.1 µs   0.8%      1
+void cublasLt::splitKreduce_kernel<32, 16, int, float, fl...       4.0 µs   0.7%      2
+void cutlass::device_kernel<flash::FlashAttnFwdCombine<cu...       3.9 µs   0.6%      1
+... 11 more
+total                                                            619.1 µs
+
+profile 10: batch=32 ctx=80000 dist=soft layer=sliding load=verify 32 page=1 q_len=8 spread=agentic
+kernel                                                           GPU time  share  calls
+moe_up_kernel(__nv_bfloat16 const*, int const*, int const...     236.7 µs  40.6%      1
+moe_down_kernel(__nv_bfloat16 const*, int const*, int con...     167.6 µs  28.7%      1
+nvjet_sm90_tst_128x128_64x6_2x1_v_bz_TNT                          36.5 µs   6.3%      2
+nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT                           32.2 µs   5.5%      1
+nvjet_sm90_tst_96x64_64x10_2x4_h_bz_TNN                           23.1 µs   4.0%      1
+void cutlass::device_kernel<flash::enable_sm90_or_later<f...      20.0 µs   3.4%      1
+nvjet_sm90_tss_64x32_64x16_1x2_h_bz_splitK_NNT                    13.2 µs   2.3%      2
+void sglang::muse_spark_norm_residual_kernel<8192l, 512, ...       8.4 µs   1.4%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 512, ...       7.4 µs   1.3%      1
+void at::native::(anonymous namespace)::vectorized_layer_...       6.1 µs   1.0%      1
+void cutlass::device_kernel<flash::FlashAttnFwdCombine<cu...       4.3 µs   0.7%      1
+moe_route_kernel(int const*, int, int const*, int*, int*,...       4.2 µs   0.7%      1
+... 10 more
+total                                                            583.5 µs
+
+profile 11: batch=32 ctx=80000 dist=soft layer=full load=verify 32 page=1 q_len=8 spread=agentic
+kernel                                                           GPU time  share  calls
+void cutlass::device_kernel<flash::enable_sm90_or_later<f...     377.6 µs  38.0%      1
+moe_up_kernel(__nv_bfloat16 const*, int const*, int const...     250.9 µs  25.2%      1
+moe_down_kernel(__nv_bfloat16 const*, int const*, int con...     173.6 µs  17.5%      1
+nvjet_sm90_tss_64x32_64x16_1x2_h_bz_splitK_NNT                    44.9 µs   4.5%      2
+nvjet_sm90_tst_128x128_64x6_2x1_v_bz_TNT                          35.4 µs   3.6%      2
+nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT                           34.0 µs   3.4%      1
+nvjet_sm90_tst_96x64_64x10_2x4_h_bz_TNN                           23.6 µs   2.4%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 512, ...       8.4 µs   0.8%      1
+void sglang::muse_spark_norm_residual_kernel<8192l, 512, ...       7.1 µs   0.7%      1
+void at::native::(anonymous namespace)::vectorized_layer_...       5.9 µs   0.6%      1
+moe_route_kernel(int const*, int, int const*, int*, int*,...       4.1 µs   0.4%      1
+moe_combine_kernel(int const*, float const*, int const*, ...       4.1 µs   0.4%      1
+... 10 more
+total                                                            994.5 µs
+GPU busy (kernels overlap: PDL or streams)                       959.0 µs
+an overlapping kernel's time includes any wait for the one before it, so the rows add up to more
