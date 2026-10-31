@@ -31,7 +31,7 @@ from typing import TypedDict
 import torch
 import torch.nn.functional as F
 
-BENCH = True
+BENCH = False
 
 
 class Weights(TypedDict):
@@ -793,28 +793,35 @@ LAYER_NAMES = ("qkv_gate", "o", "pooler", "unpooler", "router")
 # (layer, bucket) -> (kind, (rt, u, ksplit)) with kind "cuda" (Plain format), "c12" or "c12w"
 # (12-bit code); ("mm_t" | "mm_n", None) for cuBLAS on another weight layout; ("torch", None)
 # for SGLang's own dispatch. Filled from BENCH runs.
-PLAN = {  # check cf2656aa: our kernels where they beat SGLang by more than 2%
+PLAN = {  # check 89e69e97: our kernels and pinned cuBLASLt algorithms where they beat SGLang by 2%
     **{(layer, m): ("torch", None) for layer in LAYER_NAMES for m in BUCKETS},
     ("qkv_gate", 1): ("c12", (2, 2, 4, 6)),
     ("qkv_gate", 8): ("c12", (2, 2, 4, 6)),
     ("qkv_gate", 16): ("cuda", (1, 2, 4, 6)),
-    ("o", 1): ("c12", (2, 2, 1, 0)),
-    ("o", 8): ("c12w", (2, 2, 1, 0)),
+    ("qkv_gate", 32): ("mm_t", None),
+    ("qkv_gate", 128): ("lt", (2, 66, 17, 3, 2, 0, 0, 35, 0, 4)),
+    ("qkv_gate", 256): ("lt", (0, 66, 124, 1, 0, 0, 0, 35, 0, 2)),
+    ("o", 1): ("c12w", (2, 2, 1, 0)),
+    ("o", 8): ("c12", (2, 2, 1, 0)),
+    ("o", 16): ("mm_t", None),
+    ("o", 128): ("lt", (3, 66, 18, 1, 0, 0, 3, 35, 0, 5)),
+    ("o", 256): ("lt", (3, 66, 20, 1, 0, 0, 1, 35, 0, 3)),
     ("pooler", 1): ("c12", (1, 4, 1, 1)),
-    ("pooler", 8): ("c12", (1, 4, 1, 1)),
+    ("pooler", 8): ("c12w", (1, 4, 1, 0)),
     ("pooler", 16): ("c12", (2, 4, 1, 0)),
     ("pooler", 32): ("c12", (2, 2, 1, 0)),
-    ("pooler", 128): ("mm_t", None),
-    ("pooler", 256): ("mm_t", None),
+    ("pooler", 128): ("lt", (2, 66, 15, 1, 0, 0, 4, 35, 0, 2)),
+    ("pooler", 256): ("lt", (3, 66, 18, 1, 0, 0, 0, 35, 0, 2)),
     ("unpooler", 1): ("cuda", (1, 8, 1, 0)),
     ("unpooler", 8): ("cuda", (1, 8, 1, 0)),
     ("unpooler", 16): ("c12", (2, 4, 1, 5)),
     ("unpooler", 32): ("mm_t", None),
-    ("unpooler", 128): ("mm_t", None),
+    ("unpooler", 128): ("lt", (3, 66, 18, 1, 0, 0, 3, 35, 0, 5)),
+    ("unpooler", 256): ("lt", (3, 66, 20, 1, 0, 0, 4, 35, 0, 2)),
     ("router", 1): ("rs", None),
     ("router", 8): ("cuda", (1, 8, 4, 7)),
     ("router", 16): ("cuda", (2, 4, 8, 0)),
-    ("router", 32): ("cuda", (1, 2, 16, 5)),
+    ("router", 32): ("cuda", (2, 2, 8, 0)),
     ("router", 128): ("mm_st", None),
     ("router", 256): ("mm_st", None),
 }
