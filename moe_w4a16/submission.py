@@ -150,13 +150,14 @@ __global__ void __launch_bounds__(1024) moe_route_kernel(const int* __restrict__
     }
     __syncthreads();
     if (threadIdx.x == 0) {
+        const int group_size = n_ids <= 32 * TOPK ? 16 : 32;  // Smaller groups enable MT=2 at M=32.
         int off = 0, ng = 0;
         for (int e = 0; e < LOCAL; ++e) {
             cur[e] = off;
-            for (int g0 = 0; g0 < cnt[e] && ng < MAX_GROUPS; g0 += 32, ++ng) {
+            for (int g0 = 0; g0 < cnt[e] && ng < MAX_GROUPS; g0 += group_size, ++ng) {
                 meta[META_E + ng] = e;
                 meta[META_BEG + ng] = off + g0;
-                meta[META_N + ng] = min(32, cnt[e] - g0);
+                meta[META_N + ng] = min(group_size, cnt[e] - g0);
             }
             off += cnt[e];
         }
@@ -427,14 +428,14 @@ cudaError_t moe_launch(const void* x, const int* ids, const float* wts, int M, i
     const int n_ids = M * TOPK;
     if (n_ids > 32 * MAX_GROUPS - 32 * LOCAL) return cudaErrorInvalidValue;  // groups always fit
     moe_route_kernel<<<1, 1024, 0, st>>>(ids, n_ids, local_start, meta, list);
-    // topk gives each token distinct experts: n<=M, so M<=8 uses MT=1 and M<=16 uses MT<=2.
+    // topk gives each token distinct experts: M<=8 uses MT=1, M<=32 uses groups of MT<=2.
     if (M <= 8) {
         const int small_grid = M == 8 ? grid + grid / 2 : grid;  // M=8 benefits from three blocks; M=1 does not.
         launch_up<1>((const __nv_bfloat16*)x, meta, list, local_start, (const int4*)c13, (const int4*)s13,
                      gs13, (__nv_bfloat16*)act, small_grid, st);
         launch_down<1>((const __nv_bfloat16*)act, meta, list, local_start, (const int4*)c2, (const int4*)s2,
                        gs2, (__nv_bfloat16*)ybuf, small_grid, st);
-    } else if (M <= 16) {
+    } else if (M <= 32) {
         launch_up<2>((const __nv_bfloat16*)x, meta, list, local_start, (const int4*)c13, (const int4*)s13,
                      gs13, (__nv_bfloat16*)act, grid, st);
         launch_down<2>((const __nv_bfloat16*)act, meta, list, local_start, (const int4*)c2, (const int4*)s2,
