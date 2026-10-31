@@ -1068,8 +1068,7 @@ def _lt_router(kind, x, state, cfg):
 
 
 def _router_lt_variants(state, m):
-    """The heuristic's first 8 algorithms for both router kinds on layouts 0, 2 and 3. Split-K configs
-    are dropped: their extra reduction is exactly what these kinds try to avoid."""
+    """Time each router heuristic and its unsplit variant; the heuristic can return only split-K algorithms."""
     x = torch.zeros((m, state["router"].shape[1]), device=state["router"].device, dtype=torch.bfloat16)
     found = []
     for kind, (nout, w0, w2) in ROUTER_LT.items():
@@ -1078,9 +1077,11 @@ def _router_lt_variants(state, m):
             w = state[w0 if layout == 0 else w2]
             flat = _lt_mod().lt_algos(xin, w, _out(x, "router", nout), layout, state["lt_ws"], 8)
             found += [(kind, (layout, *flat[i:i + 9])) for i in range(0, len(flat), 9)]
-    candidates = [c for c in dict.fromkeys(found) if c[1][3] <= 1]  # unsplit SPLITK_NUM can be 0 or 1
-    print(f"BENCH router m={m} lt heuristics={len(found)} unsplit={len(candidates)}", flush=True)
-    return candidates
+    candidates = dict.fromkeys(found)
+    for kind, cfg in found:
+        candidates[(kind, cfg[:3] + (1, 0) + cfg[5:])] = None  # splitK=1, no reduction
+    print(f"BENCH router m={m} lt heuristics={len(found)} candidates={len(candidates)}", flush=True)
+    return list(candidates)
 
 
 def _run(kind, cfg, x, state, layer, n):
