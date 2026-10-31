@@ -439,6 +439,66 @@ cudaError_t proj_launch(int fmt, bool f32, const void* x, const void* w, const v
     if (fmt == 2) return pick<C12W, false>(&cfg, rt, mt, u, a);
     return f32 ? pick<Plain, true>(&cfg, rt, mt, u, a) : pick<Plain, false>(&cfg, rt, mt, u, a);
 }
+
+// Router at few tokens: FP32 weights read as they are, FP32 FMAs, no tensor cores, no split
+// across CTAs. One CTA per router row (256 CTAs x 512 threads); each thread issues all 4 of its
+// 16-byte weight loads at once, then reads x (bf16, clamped to row m - 1 so no branch) and adds
+// M partial dot products; warp shuffles + one shared-memory step finish the row.
+template <int M>
+__global__ void __launch_bounds__(512) router_scalar_kernel(const float* __restrict__ w,
+                                                            const __nv_bfloat16* __restrict__ x,
+                                                            float* __restrict__ out, int m) {
+    constexpr int K = 8192, NT = 512, PER = K / 4 / NT;
+    const int row = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int4* wr = reinterpret_cast<const int4*>(w + (size_t)row * K);
+    int4 wv[PER];
+#pragma unroll
+    for (int i = 0; i < PER; ++i) wv[i] = ld_stream(wr + tid + i * NT);
+    float acc[M];
+#pragma unroll
+    for (int t = 0; t < M; ++t) acc[t] = 0.f;
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+        const int c = (tid + i * NT) * 4;
+        const float4 f = make_float4(__int_as_float(wv[i].x), __int_as_float(wv[i].y), __int_as_float(wv[i].z),
+                                     __int_as_float(wv[i].w));
+#pragma unroll
+        for (int t = 0; t < M; ++t) {
+            const uint2 xv = __ldg(reinterpret_cast<const uint2*>(x + (size_t)min(t, m - 1) * K + c));
+            const float2 a = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.x));
+            const float2 b = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xv.y));
+            acc[t] = fmaf(f.w, b.y, fmaf(f.z, b.x, fmaf(f.y, a.y, fmaf(f.x, a.x, acc[t]))));
+        }
+    }
+    __shared__ float sums[M][NT / 32];
+#pragma unroll
+    for (int t = 0; t < M; ++t) {
+        float v = acc[t];
+#pragma unroll
+        for (int d = 16; d; d >>= 1) v += __shfl_down_sync(0xFFFFFFFFu, v, d);
+        if (lane == 0) sums[t][warp] = v;
+    }
+    __syncthreads();
+    if (warp == 0)
+#pragma unroll
+        for (int t = 0; t < M; ++t) {
+            float v = lane < NT / 32 ? sums[t][lane] : 0.f;
+#pragma unroll
+            for (int d = 8; d; d >>= 1) v += __shfl_down_sync(0xFFFFFFFFu, v, d);
+            if (lane == 0 && t < m) out[t * 256 + row] = v;
+        }
+}
+
+cudaError_t router_scalar_launch(const void* w, const void* x, void* out, int m, cudaStream_t stream) {
+    auto wp = static_cast<const float*>(w);
+    auto xp = static_cast<const __nv_bfloat16*>(x);
+    auto op = static_cast<float*>(out);
+    if (m == 1) router_scalar_kernel<1><<<256, 512, 0, stream>>>(wp, xp, op, m);
+    else if (m <= 4) router_scalar_kernel<4><<<256, 512, 0, stream>>>(wp, xp, op, m);
+    else if (m <= 8) router_scalar_kernel<8><<<256, 512, 0, stream>>>(wp, xp, op, m);
+    else return cudaErrorInvalidValue;
+    return cudaGetLastError();
+}
 """
 
 CUDA_TORCH = r"""
@@ -447,6 +507,14 @@ CUDA_TORCH = r"""
 
 cudaError_t proj_launch(int fmt, bool f32, const void* x, const void* w, const void* exc, void* out, int M,
                         int N, int KX, int KW, int rt, int u, int ksplit, uint32_t basew, cudaStream_t stream);
+cudaError_t router_scalar_launch(const void* w, const void* x, void* out, int m, cudaStream_t stream);
+
+void router_scalar(torch::Tensor x, torch::Tensor w, torch::Tensor out) {
+    TORCH_CHECK(x.is_contiguous() && w.is_contiguous() && out.is_contiguous() && x.size(1) == 8192);
+    const cudaError_t err = router_scalar_launch(w.data_ptr(), x.data_ptr(), out.data_ptr(), x.size(0),
+                                                 at::cuda::getCurrentCUDAStream());
+    TORCH_CHECK(err == cudaSuccess, "router_scalar: ", cudaGetErrorString(err));
+}
 
 void proj(torch::Tensor x, torch::Tensor w, torch::Tensor exc, torch::Tensor out, int64_t fmt, int64_t kx,
           int64_t kw, int64_t rt, int64_t u, int64_t ksplit, int64_t basew) {
@@ -461,6 +529,7 @@ void proj(torch::Tensor x, torch::Tensor w, torch::Tensor exc, torch::Tensor out
 CPP_DECLS = """
 void proj(torch::Tensor x, torch::Tensor w, torch::Tensor exc, torch::Tensor out, int64_t fmt, int64_t kx,
           int64_t kw, int64_t rt, int64_t u, int64_t ksplit, int64_t basew);
+void router_scalar(torch::Tensor x, torch::Tensor w, torch::Tensor out);
 """
 
 _MOD = None
@@ -475,7 +544,7 @@ def _cuda():
         try:
             _MOD = load_inline(
                 name="muse_bf16_proj_v5", cpp_sources=CPP_DECLS, cuda_sources=CUDA_KERNELS + CUDA_TORCH,
-                functions=["proj"], extra_cuda_cflags=["-O3"], verbose=False)
+                functions=["proj", "router_scalar"], extra_cuda_cflags=["-O3"], verbose=False)
             print(f"CUDA compiled in {time.time() - t0:.0f}s", flush=True)
         except Exception as e:  # noqa: BLE001 - fall back to cuBLAS and say why
             print(f"CUDA compile failed after {time.time() - t0:.0f}s: {str(e)[-3000:]}", flush=True)
@@ -655,8 +724,13 @@ def _torch(x, state, layer, n):
 
 def _mm(kind, x, state, layer, n):
     """cuBLAS with another weight layout, which makes it pick other kernels. mm_t: a [K, N]
-    copy of W; mm_n: W [N, K] as a transposed view. The router runs as one [x | x] @ [hi | lo]^T."""
+    copy of W; mm_n: W [N, K] as a transposed view. Router: mm_t / mm_n run one [x | x] @ [hi | lo]^T;
+    mm_s / mm_st run x @ [hi ; lo]^T ([m, 512], FP32) and add the halves: no copy of x."""
     if layer == "router":
+        if kind in ("mm_s", "mm_st"):
+            y = torch.mm(x, state["router_hl_t"] if kind == "mm_st" else state["router_hl"].t(),
+                         out_dtype=torch.float32)
+            return y[:, :256] + y[:, 256:]
         w = state["router_hilo_t"] if kind == "mm_t" else state["router_hilo"].t()
         return torch.mm(torch.cat([x, x], 1), w, out_dtype=torch.float32)
     w = state["wt"][layer][:, :n] if kind == "mm_t" else state[layer][:n].t()
@@ -667,7 +741,11 @@ def _run(kind, cfg, x, state, layer, n):
     if kind in ("cuda", "c12", "c12w") and _MOD:
         if not kind.startswith("c12") or state["c12"].get(layer) is not None:
             return _proj(kind, x, state, layer, n, cfg)
-    if kind in ("mm_t", "mm_n"):
+    if kind == "rs" and _MOD and x.shape[0] <= 8:  # router, FP32 scalar kernel
+        out = _out(x, layer, n)
+        _MOD.router_scalar(x, state["router"], out)
+        return out
+    if kind in ("mm_t", "mm_n", "mm_s", "mm_st"):
         return _mm(kind, x, state, layer, n)
     return _torch(x, state, layer, n)
 
@@ -681,6 +759,8 @@ def prepare(weights: Weights):
     state["router_hi_t"] = hi.t().contiguous()
     state["router_lo_t"] = lo.t().contiguous()
     state["router_hilo_t"] = state["router_hilo"].t().contiguous()
+    state["router_hl"] = torch.cat([hi, lo], dim=0).contiguous()  # [512, 8192]: hi rows, then lo rows
+    state["router_hl_t"] = state["router_hl"].t().contiguous()
     if BENCH or any(kind == "mm_t" for kind, _ in PLAN.values()):
         state["wt"] = {name: state[name].t().contiguous() for name in ("qkv_gate", "o", "pooler", "unpooler")}
     state["plan"] = dict(PLAN)
@@ -744,6 +824,8 @@ def _graph_us(fn, flush, reps=30):
 
 def _variants(state, m, layer, n, k_w):
     out = [("torch", None), ("mm_t", None), ("mm_n", None)]
+    if layer == "router":
+        out += [("mm_s", None), ("mm_st", None)] + ([("rs", None)] if m <= 8 else [])
     if PLAN.get((layer, m), ("torch",))[0] != "torch":
         out.append(PLAN[(layer, m)])
     if not _MOD or (m > 32 and layer != "router"):  # token groups lost 3-7x to cuBLAS (check 45fd2ba0)
@@ -833,7 +915,8 @@ def _sweep(state, budget_s=150.0):
             load_t[m][0] += sgl
             load_t[m][1] += best
             t_torch = next(t for t, k, _ in results if k == "torch") - FIXED_US
-            tag = {"cuda": "c", "c12": "z", "c12w": "w", "torch": "t", "mm_t": "T", "mm_n": "N"}
+            tag = {"cuda": "c", "c12": "z", "c12w": "w", "torch": "t", "mm_t": "T", "mm_n": "N", "mm_s": "S",
+                   "mm_st": "U", "rs": "R"}
             top = " ".join(f"{t - FIXED_US:.2f}{tag[k]}{list(c) if c else ''}" for t, k, c in results[:3])
             rows.append(f"m={m:<3} {layer:<8} sgl={sgl:6.2f} torch={t_torch:6.2f} best={best:6.2f} "
                         f"x{sgl / max(best, 0.05):.2f} | {top}" + (f" | bad {' '.join(bad[:4])}" if bad else ""))
