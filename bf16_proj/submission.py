@@ -103,74 +103,64 @@ __device__ __forceinline__ void pipeline2(int k_begin, int k_end, Load& load, Co
     }
 }
 
-// The end of ksplit_kernel. The 8 warps of the CTA: warps 4-7 hand their partials to warps 0-3,
-// then all threads add the 4 remaining copies into red[0]. Two rounds keep shared memory at 4
-// copies. With ksplit > 1 the cluster's CTAs reduce-scatter: rank r sums its 1/ksplit slice of
-// the elements over all ranks' red[0] through DSMEM (independent loads, all ranks at once) and
-// stores that slice. Tokens m0 .. m0 + M - 1 of rows row0 .. row0 + 16 * RT - 1.
-template <int RT, int MT, bool OUT_F32>
-__device__ __forceinline__ void reduce_store(float (&acc)[RT][MT][4], float (*red)[RT * MT * 128],
-                                             void* out, int row0, int m0, int M, int N) {
-    constexpr int E = RT * MT * 128;
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    if (warp >= 4)
+// The end of ksplit_kernel. The CTA's NW = WR * WK warps write their partials to shared memory;
+// for each of the WR row groups, the sum over its WK k-warps is formed by adjacent threads
+// (element idx = wr * E + e). With ksplit > 1 the cluster's CTAs then reduce-scatter: rank r
+// sums its 1/ksplit slice of the elements over all ranks through DSMEM (independent loads, all
+// ranks at once) and stores that slice. Rows row0 .. row0 + 16 * RT * WR - 1, tokens m0 + tok.
+template <int RT, int MT, bool OUT_F32, int WR, int WK>
+__device__ __forceinline__ void reduce_store(float (&acc)[RT][MT][4], float* red, void* out, int row0, int m0,
+                                             int M, int N) {
+    constexpr int E = RT * MT * 128, NT = WR * WK * 32, F = WR * E, PER = (F + NT - 1) / NT;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, tid = threadIdx.x;
 #pragma unroll
-        for (int rt = 0; rt < RT; ++rt)
+    for (int rt = 0; rt < RT; ++rt)
 #pragma unroll
-            for (int nt = 0; nt < MT; ++nt)
+        for (int nt = 0; nt < MT; ++nt)
 #pragma unroll
-                for (int j = 0; j < 4; ++j) red[warp - 4][((rt * MT + nt) * 4 + j) * 32 + lane] = acc[rt][nt][j];
+            for (int j = 0; j < 4; ++j) red[warp * E + ((rt * MT + nt) * 4 + j) * 32 + lane] = acc[rt][nt][j];
     __syncthreads();
-    if (warp < 4)
+    float v[PER];
 #pragma unroll
-        for (int rt = 0; rt < RT; ++rt)
+    for (int i = 0; i < PER; ++i) {
+        const int idx = i * NT + tid;
+        v[i] = 0.f;
+        if (idx < F)
 #pragma unroll
-            for (int nt = 0; nt < MT; ++nt)
-#pragma unroll
-                for (int j = 0; j < 4; ++j) acc[rt][nt][j] += red[warp][((rt * MT + nt) * 4 + j) * 32 + lane];
-    __syncthreads();
-    if (warp < 4)
-#pragma unroll
-        for (int rt = 0; rt < RT; ++rt)
-#pragma unroll
-            for (int nt = 0; nt < MT; ++nt)
-#pragma unroll
-                for (int j = 0; j < 4; ++j) red[warp][((rt * MT + nt) * 4 + j) * 32 + lane] = acc[rt][nt][j];
-    __syncthreads();
-#pragma unroll 1  // rolled loops keep the kernel small: its code comes from HBM on every call
-    for (int e = threadIdx.x; e < E; e += 256) red[0][e] = red[0][e] + red[1][e] + red[2][e] + red[3][e];
-
-    auto store = [&](int e, float v) {
-        const int ln = e & 31, j = (e >> 5) & 3, nt = (e >> 7) % MT, rt = (e >> 7) / MT;
-        const int row = row0 + rt * 16 + (ln >> 2) + (j >= 2 ? 8 : 0);
+            for (int wk = 0; wk < WK; ++wk) v[i] += red[(wk * WR + idx / E) * E + idx % E];
+    }
+    auto store = [&](int idx, float s) {
+        const int e = idx % E, ln = e & 31, j = (e >> 5) & 3, nt = (e >> 7) % MT, rt = (e >> 7) / MT;
+        const int row = row0 + (idx / E * RT + rt) * 16 + (ln >> 2) + (j >= 2 ? 8 : 0);
         const int tok = nt * 8 + 2 * (ln & 3) + (j & 1);
         if (tok < M) {
             const size_t o = (size_t)(m0 + tok) * N + row;
-            if (OUT_F32) reinterpret_cast<float*>(out)[o] = v;
-            else reinterpret_cast<__nv_bfloat16*>(out)[o] = __float2bfloat16(v);
+            if (OUT_F32) reinterpret_cast<float*>(out)[o] = s;
+            else reinterpret_cast<__nv_bfloat16*>(out)[o] = __float2bfloat16(s);
         }
     };
     const int ksplit = gridDim.y;
-    if (ksplit > 1) {
-        cg::cluster_group cluster = cg::this_cluster();
-        cluster.sync();
-        const int chunk = E / ksplit, e0 = (int)cluster.block_rank() * chunk;  // E % ksplit == 0
-        float v[2] = {0.f, 0.f};  // chunk <= 512 = 2 elements per thread
+    if (ksplit == 1) {
 #pragma unroll
-        for (int i = 0; i < 2; ++i)
-            if (i * 256 + (int)threadIdx.x < chunk)
-#pragma unroll 4
-                for (int q = 0; q < ksplit; ++q)
-                    v[i] += cluster.map_shared_rank(&red[0][0], q)[e0 + i * 256 + threadIdx.x];
-        cluster.sync();  // the others' shared memory must outlive this CTA's reads
-#pragma unroll
-        for (int i = 0; i < 2; ++i)
-            if (i * 256 + (int)threadIdx.x < chunk) store(e0 + i * 256 + threadIdx.x, v[i]);
+        for (int i = 0; i < PER; ++i)
+            if (i * NT + tid < F) store(i * NT + tid, v[i]);
         return;
     }
-    __syncthreads();
+    __syncthreads();  // every warp has read red before it is overwritten with the CTA sums
+#pragma unroll
+    for (int i = 0; i < PER; ++i)
+        if (i * NT + tid < F) red[i * NT + tid] = v[i];
+    cg::cluster_group cluster = cg::this_cluster();
+    cluster.sync();
+    const int chunk = F / ksplit, e0 = (int)cluster.block_rank() * chunk;  // F % ksplit == 0
 #pragma unroll 1
-    for (int e = threadIdx.x; e < E; e += 256) store(e, red[0][e]);
+    for (int i = tid; i < chunk; i += NT) {
+        float s = 0.f;
+#pragma unroll 4
+        for (int q = 0; q < ksplit; ++q) s += cluster.map_shared_rank(red, q)[e0 + i];
+        store(e0 + i, s);
+    }
+    cluster.sync();  // the others' shared memory must outlive this CTA's reads
 }
 
 // One bf16x2 fragment register from the 12-bit code (see pack_c12 in Python). s holds the
@@ -350,30 +340,34 @@ __device__ __forceinline__ void zero(float (&acc)[RT][MT][4]) {
             for (int j = 0; j < 4; ++j) acc[rt][nt][j] = 0.f;
 }
 
-// out[M, N] = x[M, KX] @ W[N, KW]^T. 256 threads; grid (N / (16 * RT), ksplit, ceil(M / 32));
+// out[M, N] = x[M, KX] @ W[N, KW]^T. WR * WK * 32 threads; grid (N / (16 * RT * WR), ksplit, ceil(M / 32));
 // ksplit > 1 runs as a (1, ksplit, 1) cluster; blockIdx.z picks 32 tokens (all groups read the
-// same W stream). A CTA owns RT tiles (16 * RT rows); its 8 warps split the CTA's K range and
-// add their partials in shared memory (reduce_store). w is in stream order for this geometry.
-template <class F, int RT, int MT, int U, bool OUT_F32>
-__global__ void __launch_bounds__(256) ksplit_kernel(
+// same W stream). A CTA has WR x WK warps: warp (wr = warp % WR, wk = warp / WR) owns the RT tiles
+// (blockIdx.x * WR + wr) * RT .. + RT - 1 and the wk-th of WK slices of the CTA's K range. The WR
+// row groups share x through L1; the WK k-warps add their partials in shared memory
+// (reduce_store). w is in stream order for this geometry.
+template <class F, int RT, int MT, int U, bool OUT_F32, int WR, int WK>
+__global__ void __launch_bounds__(WR * WK * 32) ksplit_kernel(
         const __nv_bfloat16* __restrict__ x, const int4* __restrict__ w, const int2* __restrict__ exc,
         void* __restrict__ out, int M, int N, int KX, int KW, int k_cta, uint32_t basew) {
-    __shared__ float red[4][RT * MT * 128];
-    const int warp = threadIdx.x >> 5;
+    constexpr int NW = WR * WK;
+    __shared__ float red[NW * RT * MT * 128];
+    const int warp = threadIdx.x >> 5, wr = warp % WR, wk = warp / WR;
     const int m0 = blockIdx.z * 32, Mz = min(M - m0, 32);
     x += (size_t)m0 * KX;
-    const int kw = k_cta >> 3, k_begin = blockIdx.y * k_cta + warp * kw;
+    const int kw = k_cta / WK, k_begin = blockIdx.y * k_cta + wk * kw;
     constexpr int STEP = RT * (U / F::NK) * F::KB;  // int4s per warp step
-    const int gw = (blockIdx.y * gridDim.x + blockIdx.x) * 8 + warp;
+    const int gw = (blockIdx.y * gridDim.x + blockIdx.x) * NW + warp;
     const int4* wq = w + (size_t)gw * STEP;
-    const size_t sstride = (size_t)gridDim.x * gridDim.y * 8 * STEP;
+    const size_t sstride = (size_t)gridDim.x * gridDim.y * NW * STEP;
+    const int tile0 = (blockIdx.x * WR + wr) * RT;
     int2 ec[RT][2];
-    if constexpr (F::EXC) exc_prefetch(ec, exc, blockIdx.x * RT);
+    if constexpr (F::EXC) exc_prefetch(ec, exc, tile0);
     float acc[RT][MT][4];
     zero(acc);
     mainloop<F, RT, MT, U>(acc, wq, sstride, x, KX, Mz, k_begin, k_begin + kw, basew);
     if constexpr (F::EXC) apply_exceptions(acc, ec, x, KX, Mz, k_begin, k_begin + kw);
-    reduce_store<RT, MT, OUT_F32>(acc, red, out, blockIdx.x * 16 * RT, m0, Mz, N);
+    reduce_store<RT, MT, OUT_F32, WR, WK>(acc, red, out, blockIdx.x * 16 * RT * WR, m0, Mz, N);
 }
 
 struct Args {
@@ -381,9 +375,9 @@ struct Args {
     int M, N, KX, KW, k_cta; uint32_t basew;
 };
 
-template <class F, int RT, int MT, int U, bool F32>
+template <class F, int RT, int MT, int U, bool F32, int WR, int WK>
 static cudaError_t go(cudaLaunchConfig_t* cfg, const Args& a) {
-    auto kern = ksplit_kernel<F, RT, MT, U, F32>;
+    auto kern = ksplit_kernel<F, RT, MT, U, F32, WR, WK>;
     if (cfg->gridDim.y > 8) {  // clusters of 16 CTAs are a non-portable size on Hopper
         const cudaError_t e = cudaFuncSetAttribute(kern, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
         if (e != cudaSuccess) return e;
@@ -391,39 +385,67 @@ static cudaError_t go(cudaLaunchConfig_t* cfg, const Args& a) {
     return cudaLaunchKernelEx(cfg, kern, a.x, a.w, a.exc, a.out, a.M, a.N, a.KX, a.KW, a.k_cta, a.basew);
 }
 
-// Instances that fit in registers with two pipeline stages (see _unroll_ok in Python):
-// U 8 only at RT 1, MT 1; U 4 at RT 1 or MT <= 2; U 2 always.
-template <class F, int RT, int MT, bool F32>
+// Warp grids (WR, WK): 0 = (1, 8) 256 threads, 1 = (2, 8) 512, 2 = (2, 16) 1024, 3 = (4, 8) 1024.
+// Instances that fit in registers with two pipeline stages (mirrored by _unroll_ok in Python):
+// 256 threads: U 8 only at RT 1, MT 1; U 4 at RT 1 or MT <= 2; U 2 always.
+// 512 threads: RT 1; U 2, or U 4 at MT 1.  1024 threads: RT 1, MT 1, U 1 or 2.
+template <class F, int RT, int MT, bool F32, int WR, int WK>
 static cudaError_t pick_u(cudaLaunchConfig_t* cfg, int u, const Args& a) {
-    if constexpr (RT == 1 && MT == 1) {
-        if (u == 8) return go<F, RT, MT, 8, F32>(cfg, a);
+    constexpr int NT = WR * WK * 32;
+    if constexpr (NT == 256) {
+        if constexpr (RT == 1 && MT == 1) {
+            if (u == 8) return go<F, RT, MT, 8, F32, WR, WK>(cfg, a);
+        }
+        if constexpr (RT == 1 || MT <= 2) {
+            if (u == 4) return go<F, RT, MT, 4, F32, WR, WK>(cfg, a);
+        }
+        if (u == 2) return go<F, RT, MT, 2, F32, WR, WK>(cfg, a);
+    } else if constexpr (NT == 512 && RT == 1 && !F32) {
+        if constexpr (MT == 1) {
+            if (u == 4) return go<F, RT, MT, 4, F32, WR, WK>(cfg, a);
+        }
+        if (u == 2) return go<F, RT, MT, 2, F32, WR, WK>(cfg, a);
+    } else if constexpr (NT == 1024 && RT == 1 && MT == 1 && !F32) {
+        if constexpr (F::NK == 1) {
+            if (u == 1) return go<F, RT, MT, 1, F32, WR, WK>(cfg, a);
+        }
+        if (u == 2) return go<F, RT, MT, 2, F32, WR, WK>(cfg, a);
     }
-    if constexpr (RT == 1 || MT <= 2) {
-        if (u == 4) return go<F, RT, MT, 4, F32>(cfg, a);
-    }
-    if (u == 2) return go<F, RT, MT, 2, F32>(cfg, a);
     return cudaErrorInvalidValue;
 }
 
-template <class F, bool F32>
-static cudaError_t pick(cudaLaunchConfig_t* cfg, int rt, int mt, int u, const Args& a) {
+template <class F, bool F32, int WR, int WK>
+static cudaError_t pick_g(cudaLaunchConfig_t* cfg, int rt, int mt, int u, const Args& a) {
     if (rt == 1) {
-        if (mt == 1) return pick_u<F, 1, 1, F32>(cfg, u, a);
-        if (mt == 2) return pick_u<F, 1, 2, F32>(cfg, u, a);
-        return pick_u<F, 1, 4, F32>(cfg, u, a);
+        if (mt == 1) return pick_u<F, 1, 1, F32, WR, WK>(cfg, u, a);
+        if (mt == 2) return pick_u<F, 1, 2, F32, WR, WK>(cfg, u, a);
+        return pick_u<F, 1, 4, F32, WR, WK>(cfg, u, a);
     }
-    if (mt == 1) return pick_u<F, 2, 1, F32>(cfg, u, a);
-    if (mt == 2) return pick_u<F, 2, 2, F32>(cfg, u, a);
-    return pick_u<F, 2, 4, F32>(cfg, u, a);
+    if (mt == 1) return pick_u<F, 2, 1, F32, WR, WK>(cfg, u, a);
+    if (mt == 2) return pick_u<F, 2, 2, F32, WR, WK>(cfg, u, a);
+    return pick_u<F, 2, 4, F32, WR, WK>(cfg, u, a);
 }
 
-// fmt 0: Plain (FP32 output only here: the router), 1: C12, 2: C12W.
+template <class F, bool F32>
+static cudaError_t pick(cudaLaunchConfig_t* cfg, int g, int rt, int mt, int u, const Args& a) {
+    if (g == 0) return pick_g<F, F32, 1, 8>(cfg, rt, mt, u, a);
+    if (g == 1) return pick_g<F, F32, 2, 8>(cfg, rt, mt, u, a);
+    if (g == 2) return pick_g<F, F32, 2, 16>(cfg, rt, mt, u, a);
+    return pick_g<F, F32, 4, 8>(cfg, rt, mt, u, a);
+}
+
+static const int GEOM_WR[4] = {1, 2, 2, 4}, GEOM_WK[4] = {8, 8, 16, 8};
+
+// fmt 0: Plain (FP32 output only here: the router), 1: C12, 2: C12W. g: warp grid (see pick_u).
 cudaError_t proj_launch(int fmt, bool f32, const void* x, const void* w, const void* exc, void* out, int M,
-                        int N, int KX, int KW, int rt, int u, int ksplit, uint32_t basew, cudaStream_t stream) {
-    if (N % (16 * rt) || (fmt > 0 && (f32 || KX != KW))) return cudaErrorInvalidValue;
+                        int N, int KX, int KW, int g, int rt, int u, int ksplit, uint32_t basew,
+                        cudaStream_t stream) {
+    if (g < 0 || g > 3) return cudaErrorInvalidValue;
+    const int wr = GEOM_WR[g], wk = GEOM_WK[g];
+    if (N % (16 * rt * wr) || (fmt > 0 && (f32 || KX != KW))) return cudaErrorInvalidValue;
     cudaLaunchConfig_t cfg = {};
-    cfg.gridDim = dim3(N / (16 * rt), ksplit, (M + 31) / 32);
-    cfg.blockDim = dim3(256, 1, 1);
+    cfg.gridDim = dim3(N / (16 * rt * wr), ksplit, (M + 31) / 32);
+    cfg.blockDim = dim3(wr * wk * 32, 1, 1);
     cfg.stream = stream;
     cudaLaunchAttribute attr[1];
     attr[0].id = cudaLaunchAttributeClusterDimension;
@@ -435,9 +457,9 @@ cudaError_t proj_launch(int fmt, bool f32, const void* x, const void* w, const v
     const int mt = M <= 8 ? 1 : M <= 16 ? 2 : 4;
     const Args a{static_cast<const __nv_bfloat16*>(x), static_cast<const int4*>(w), static_cast<const int2*>(exc),
                  out, M, N, KX, KW, KW / ksplit, basew};
-    if (fmt == 1) return pick<C12, false>(&cfg, rt, mt, u, a);
-    if (fmt == 2) return pick<C12W, false>(&cfg, rt, mt, u, a);
-    return f32 ? pick<Plain, true>(&cfg, rt, mt, u, a) : pick<Plain, false>(&cfg, rt, mt, u, a);
+    if (fmt == 1) return pick<C12, false>(&cfg, g, rt, mt, u, a);
+    if (fmt == 2) return pick<C12W, false>(&cfg, g, rt, mt, u, a);
+    return f32 ? pick<Plain, true>(&cfg, g, rt, mt, u, a) : pick<Plain, false>(&cfg, g, rt, mt, u, a);
 }
 
 // Router at few tokens: FP32 weights read as they are, FP32 FMAs, no tensor cores, no split
@@ -506,7 +528,8 @@ CUDA_TORCH = r"""
 #include <ATen/cuda/CUDAContext.h>
 
 cudaError_t proj_launch(int fmt, bool f32, const void* x, const void* w, const void* exc, void* out, int M,
-                        int N, int KX, int KW, int rt, int u, int ksplit, uint32_t basew, cudaStream_t stream);
+                        int N, int KX, int KW, int g, int rt, int u, int ksplit, uint32_t basew,
+                        cudaStream_t stream);
 cudaError_t router_scalar_launch(const void* w, const void* x, void* out, int m, cudaStream_t stream);
 
 void router_scalar(torch::Tensor x, torch::Tensor w, torch::Tensor out) {
@@ -517,18 +540,18 @@ void router_scalar(torch::Tensor x, torch::Tensor w, torch::Tensor out) {
 }
 
 void proj(torch::Tensor x, torch::Tensor w, torch::Tensor exc, torch::Tensor out, int64_t fmt, int64_t kx,
-          int64_t kw, int64_t rt, int64_t u, int64_t ksplit, int64_t basew) {
+          int64_t kw, int64_t g, int64_t rt, int64_t u, int64_t ksplit, int64_t basew) {
     TORCH_CHECK(x.is_contiguous() && w.is_contiguous() && out.is_contiguous());
     const cudaError_t err = proj_launch(
         fmt, out.scalar_type() == at::kFloat, x.data_ptr(), w.data_ptr(), exc.data_ptr(), out.data_ptr(),
-        x.size(0), out.size(1), kx, kw, rt, u, ksplit, (uint32_t)basew, at::cuda::getCurrentCUDAStream());
+        x.size(0), out.size(1), kx, kw, g, rt, u, ksplit, (uint32_t)basew, at::cuda::getCurrentCUDAStream());
     TORCH_CHECK(err == cudaSuccess, "proj: ", cudaGetErrorString(err));
 }
 """
 
 CPP_DECLS = """
 void proj(torch::Tensor x, torch::Tensor w, torch::Tensor exc, torch::Tensor out, int64_t fmt, int64_t kx,
-          int64_t kw, int64_t rt, int64_t u, int64_t ksplit, int64_t basew);
+          int64_t kw, int64_t g, int64_t rt, int64_t u, int64_t ksplit, int64_t basew);
 void router_scalar(torch::Tensor x, torch::Tensor w, torch::Tensor out);
 """
 
@@ -560,22 +583,22 @@ LAYER_NAMES = ("qkv_gate", "o", "pooler", "unpooler", "router")
 # for SGLang's own dispatch. Filled from BENCH runs.
 PLAN = {  # check c30eb344 (submit 93e147b6 ran its sweep): our kernels where they beat SGLang by > 2%
     **{(layer, m): ("torch", None) for layer in LAYER_NAMES for m in BUCKETS},
-    ("qkv_gate", 1): ("cuda", (1, 4, 1)),
-    ("o", 1): ("c12w", (2, 2, 1)),
-    ("pooler", 1): ("c12", (1, 4, 1)),
-    ("unpooler", 1): ("cuda", (1, 8, 1)),
-    ("router", 1): ("cuda", (2, 4, 8)),
-    ("qkv_gate", 8): ("cuda", (1, 2, 2)),
-    ("o", 8): ("cuda", (2, 2, 1)),
-    ("pooler", 8): ("c12", (1, 4, 1)),
-    ("unpooler", 8): ("cuda", (1, 8, 1)),
-    ("router", 8): ("cuda", (1, 4, 8)),
-    ("pooler", 16): ("cuda", (2, 2, 1)),
-    ("router", 16): ("cuda", (2, 4, 8)),
+    ("qkv_gate", 1): ("cuda", (1, 4, 1, 0)),
+    ("o", 1): ("c12w", (2, 2, 1, 0)),
+    ("pooler", 1): ("c12", (1, 4, 1, 0)),
+    ("unpooler", 1): ("cuda", (1, 8, 1, 0)),
+    ("router", 1): ("cuda", (2, 4, 8, 0)),
+    ("qkv_gate", 8): ("cuda", (1, 2, 2, 0)),
+    ("o", 8): ("cuda", (2, 2, 1, 0)),
+    ("pooler", 8): ("c12", (1, 4, 1, 0)),
+    ("unpooler", 8): ("cuda", (1, 8, 1, 0)),
+    ("router", 8): ("cuda", (1, 4, 8, 0)),
+    ("pooler", 16): ("cuda", (2, 2, 1, 0)),
+    ("router", 16): ("cuda", (2, 4, 8, 0)),
     ("qkv_gate", 32): ("mm_t", None),
     ("pooler", 32): ("mm_t", None),
     ("unpooler", 32): ("mm_t", None),
-    ("router", 32): ("cuda", (2, 2, 8)),
+    ("router", 32): ("cuda", (2, 2, 8, 0)),
     ("o", 128): ("mm_n", None),
     ("pooler", 128): ("mm_t", None),
     ("unpooler", 128): ("mm_t", None),
@@ -585,10 +608,17 @@ PLAN = {  # check c30eb344 (submit 93e147b6 ran its sweep): our kernels where th
 }
 
 
-def _unroll_ok(rt, u, m):
-    """The (RT, U) instances the CUDA launchers compile for this token count (no spills)."""
-    mt = 1 if m <= 8 else 2 if m <= 16 else 4
-    return u == 2 or (u == 4 and (rt == 1 or mt <= 2)) or (u == 8 and rt == 1 and mt == 1)
+GEOMS = ((1, 8), (2, 8), (2, 16), (4, 8))  # warp grids (WR, WK) of ksplit_kernel, index g
+
+
+def _unroll_ok(rt, u, m, g):
+    """The (RT, U) instances the CUDA launchers compile for this token count and warp grid."""
+    mt, nt = (1 if m <= 8 else 2 if m <= 16 else 4), GEOMS[g][0] * GEOMS[g][1] * 32
+    if nt == 256:
+        return u == 2 or (u == 4 and (rt == 1 or mt <= 2)) or (u == 8 and rt == 1 and mt == 1)
+    if nt == 512:
+        return rt == 1 and (u == 2 or (u == 4 and mt == 1))
+    return rt == 1 and mt == 1 and u in (1, 2)
 
 
 def _bucket(m):
@@ -616,28 +646,29 @@ def pack_weight(w):
     return units.view(torch.uint8).view(n // 16, k // 32, 1024)
 
 
-def pack_stream(units, nk, rt, u, ks):
+def pack_stream(units, nk, rt, u, ks, g):
     """Units [tiles, n_units, bytes] (a unit holds nk k blocks of a tile) -> the order in which
-    ksplit_kernel with (rt, u, ks) reads them: a warp step is rt * (u / nk) units, and step s of
-    warp gw = (by * GX + bx) * 8 + warp sits at (s * G + gw) * step, so at each step the whole grid
-    reads one contiguous region. Warp (bx, by, warp) owns tiles bx * rt .. + rt - 1 and units
-    (by * 8 + warp) * per_warp .. + per_warp - 1 of each."""
+    ksplit_kernel with (rt, u, ks, warp grid g) reads them: a warp step is rt * (u / nk) units, and
+    step s of warp gw = (by * GX + bx) * NW + warp sits at (s * G + gw) * step, so at each step the
+    whole grid reads one contiguous region. Warp (bx, by, warp) with wr = warp % WR, wk = warp // WR
+    owns tiles (bx * WR + wr) * rt .. + rt - 1 and units (by * WK + wk) * per_warp .. of each."""
+    wr_n, wk_n = GEOMS[g]
     tiles, nu, nbytes = units.shape
-    vu, per_warp = u // nk, nu // (ks * 8)
-    shape = (per_warp // vu, ks, tiles // rt, 8, rt, vu)
+    vu, per_warp = u // nk, nu // (ks * wk_n)
+    shape = (per_warp // vu, ks, tiles // (rt * wr_n), wr_n * wk_n, rt, vu)
     ix = [torch.arange(d, device=units.device).view([-1 if i == j else 1 for j in range(6)])
           for i, d in enumerate(shape)]
     s, by, bx, warp, r, v = ix
-    src = (bx * rt + r) * nu + (by * 8 + warp) * per_warp + s * vu + v
+    src = ((bx * wr_n + warp % wr_n) * rt + r) * nu + (by * wk_n + warp // wr_n) * per_warp + s * vu + v
     return units.reshape(tiles * nu, nbytes)[src.reshape(-1)].contiguous()
 
 
-def _stream(state, layer, n, kind, rt, u, ks):
+def _stream(state, layer, n, kind, rt, u, ks, g):
     """The stream-ordered weights for one launch geometry, packed once and cached."""
-    key = (layer, n, kind, rt, u, ks)
+    key = (layer, n, kind, rt, u, ks, g)
     if key not in state["streams"]:
         units = state["units"][layer] if kind == "cuda" else state["c12"][layer]["w12" if kind == "c12" else "w12w"]
-        state["streams"][key] = pack_stream(units[: n // 16], 2 if kind == "c12w" else 1, rt, u, ks)
+        state["streams"][key] = pack_stream(units[: n // 16], 2 if kind == "c12w" else 1, rt, u, ks, g)
     return state["streams"][key]
 
 
@@ -699,16 +730,16 @@ def pack_c12(w):
 
 
 def _proj(kind, x, state, layer, n, cfg):
-    """Our kernel: kind "cuda" (Plain format), "c12" (C12) or "c12w" (C12W)."""
-    rt, u, ksplit = cfg
+    """Our kernel: kind "cuda" (Plain format), "c12" (C12) or "c12w" (C12W); cfg (rt, u, ksplit, g)."""
+    rt, u, ksplit, g = cfg
     out = _out(x, layer, n)
-    w = _stream(state, layer, n, kind, rt, u, ksplit)
+    w = _stream(state, layer, n, kind, rt, u, ksplit, g)
     if kind == "cuda":
         k_x = state["router"].shape[1] if layer == "router" else x.shape[1]
-        _MOD.proj(x, w, state["none"], out, 0, k_x, state["units"][layer].shape[1] * 32, rt, u, ksplit, 0)
+        _MOD.proj(x, w, state["none"], out, 0, k_x, state["units"][layer].shape[1] * 32, g, rt, u, ksplit, 0)
     else:
         c = state["c12"][layer]
-        _MOD.proj(x, w, c["exc"], out, 1 if kind == "c12" else 2, x.shape[1], x.shape[1], rt, u, ksplit,
+        _MOD.proj(x, w, c["exc"], out, 1 if kind == "c12" else 2, x.shape[1], x.shape[1], g, rt, u, ksplit,
                   c["basew"])
     return out
 
@@ -832,14 +863,17 @@ def _variants(state, m, layer, n, k_w):
         return out
     has_c12 = state["c12"].get(layer) is not None
     for kind in ["cuda"] + (["c12", "c12w"] if has_c12 else []):
-        for rt in (1, 2):
-            for u in (2, 4, 8):
-                for ks in (1, 2, 4, 8, 16):
-                    ctas = n // (16 * rt) * ks
-                    if (n % (16 * rt) or k_w % (ks * 8 * 32 * u) or not 32 <= ctas <= 2112
-                            or not _unroll_ok(rt, u, m)):
-                        continue
-                    out.append((kind, (rt, u, ks)))
+        for g, (wr, wk) in enumerate(GEOMS):
+            if g and layer == "router":  # FP32 output: 256-thread grid only
+                continue
+            for rt in (1, 2):
+                for u in (1, 2, 4, 8):
+                    for ks in (1, 2, 4, 8, 16):
+                        ctas = n // (16 * rt * wr) * ks
+                        if (n % (16 * rt * wr) or k_w % (ks * wk * 32 * u) or not 32 <= ctas <= 2112
+                                or not _unroll_ok(rt, u, m, g) or (kind == "c12w" and u % 2)):
+                            continue
+                        out.append((kind, (rt, u, ks, g)))
     return out
 
 
@@ -910,6 +944,10 @@ def _sweep(state, budget_s=150.0):
             results.sort(key=lambda r: r[0])
             best_t, kind, cfg = results[0]
             state["plan"][(layer, m)] = (kind, cfg)
+            keep = {(ly, 1024 if ly == "unpooler" and mm <= 8 else state["units"][ly].shape[0] * 16, k, *c)
+                    for (ly, mm), (k, c) in state["plan"].items() if k in ("cuda", "c12", "c12w")}
+            for key in [key for key in state["streams"] if key not in keep]:  # bounded GPU memory
+                del state["streams"][key]
             sgl, best = t_sgl - FIXED_US, best_t - FIXED_US
             load_t.setdefault(m, [0.0, 0.0])
             load_t[m][0] += sgl
