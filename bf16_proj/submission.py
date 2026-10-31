@@ -31,7 +31,7 @@ from typing import TypedDict
 import torch
 import torch.nn.functional as F
 
-BENCH = False
+BENCH = True
 
 
 class Weights(TypedDict):
