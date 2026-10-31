@@ -307,7 +307,8 @@ __device__ __forceinline__ void apply_exceptions(float (&acc)[RT][MT][4], const 
     for (int rt = 0; rt < RT; ++rt)
 #pragma unroll
         for (int c = 0; c < 2; ++c)
-            for (int i = 0; i < 32; ++i) {
+#pragma unroll 1  // rolled: unrolled, this loop made the kernel up to 170 KB of code, fetched
+            for (int i = 0; i < 32; ++i) {  // from HBM on every call (the judge flushes L2)
                 const int ex = __shfl_sync(0xFFFFFFFFu, ec[rt][c].x, i);
                 if (ex == 0xFFFF) break;  // padding: the rest of the slots are empty
                 const int ey = __shfl_sync(0xFFFFFFFFu, ec[rt][c].y, i);
