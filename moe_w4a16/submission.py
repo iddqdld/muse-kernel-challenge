@@ -160,7 +160,7 @@ __global__ void __launch_bounds__(1024) moe_route_kernel(const int* __restrict__
     }
 }
 
-// Each warp prefetches all packed weight chunks before dequantizing and using four K steps.
+// Each warp prefetches packed weights, then consumes four K steps per activation-row pair.
 template <int MT, int NCHUNK>
 __device__ __forceinline__ void warp_tile(const int4* __restrict__ cp, const int4* __restrict__ sp,
                                           const __nv_bfloat16* const (&brow)[MT], float (&acc)[MT][4]) {
