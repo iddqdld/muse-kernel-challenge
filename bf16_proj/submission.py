@@ -31,7 +31,7 @@ from typing import TypedDict
 import torch
 import torch.nn.functional as F
 
-BENCH = False
+BENCH = True
 
 
 class Weights(TypedDict):
@@ -163,15 +163,19 @@ __device__ __forceinline__ void reduce_store(float (&acc)[RT][MT][4], float* red
     cluster.sync();  // the others' shared memory must outlive this CTA's reads
 }
 
-// One bf16x2 fragment register from the 12-bit code (see pack_c12 in Python). s holds the
-// sign | mantissa bytes of values 4 * (J / 2) .. + 3; pair J is bytes 2 * (J % 2) and + 1.
-// q holds 8 exponent codes: pair J's two codes are nibbles J and J + 4, so one shift puts
-// them at bits 7-10 and 23-26. Result: sign << 15 | (code + base) << 7 | mantissa, per half.
-template <int J>
-__device__ __forceinline__ uint32_t dec_pair(uint32_t s, uint32_t q, uint32_t basew) {
-    const uint32_t b = __byte_perm(s, 0u, (J & 1) ? 0x4342u : 0x4140u);  // 0x00 s1m1 00 s0m0
-    const uint32_t e = (J == 0 ? q << 7 : J == 1 ? q << 3 : J == 2 ? q >> 1 : q >> 5) & 0x07800780u;
-    return (b & 0x00800080u) * 0xFFu + b + e + basew;  // sign bit 7 -> 15: s * 0x7F80 + s * 0x80
+// 8 values of one W row from the 12-bit code (see pack_c12 in Python). L0 / L1: the low bytes of
+// values 0-3 / 4-7 (bf16 bits 0-7: exponent LSB and mantissa). C: nibble i holds, in bits 0-2, the
+// index of value i's high exponent bits (bf16 bits 8-14) in the table T0 | T1 (bytes base + 0..7);
+// bit 3 of nibbles 0, 4, 1, 5, 2, 6, 3, 7 holds the sign of values 0..7. Two prmt look up the
+// high bytes, four prmt interleave them with the low bytes, the shifted C adds the signs.
+__device__ __forceinline__ void c12_row(uint32_t L0, uint32_t L1, uint32_t C, uint32_t T0, uint32_t T1,
+                                        int (&a)[4]) {
+    const uint32_t cm = C & 0x77777777u;
+    const uint32_t hlo = __byte_perm(T0, T1, cm), hhi = __byte_perm(T0, T1, cm >> 16);
+    a[0] = __byte_perm(L0, hlo, 0x5140u) | ((C << 12) & 0x80008000u);
+    a[1] = __byte_perm(L0, hlo, 0x7362u) | ((C << 8) & 0x80008000u);
+    a[2] = __byte_perm(L1, hhi, 0x5140u) | ((C << 4) & 0x80008000u);
+    a[3] = __byte_perm(L1, hhi, 0x7362u) | (C & 0x80008000u);
 }
 
 // Weight formats. Lane (g = lane / 4, t = lane % 4) holds W rows g and g + 8 of a 16-row tile;
@@ -193,16 +197,16 @@ struct Plain {  // pack_weight: per k block 64 int4s, rows 0-7 then rows 8-15, l
     }
 };
 
-// One k block of the 12-bit code: s = sign | mantissa of rows g and g + 8, q0 / q1 = their codes.
-__device__ __forceinline__ void c12_frag(int4 s, uint32_t q0, uint32_t q1, uint32_t basew, int (&a)[4],
+// One k block of the 12-bit code: s = low bytes of rows g and g + 8, q0 / q1 = their code words,
+// base = the table's first high-exponent value (bytes base .. base + 7).
+__device__ __forceinline__ void c12_frag(int4 s, uint32_t q0, uint32_t q1, uint32_t base, int (&a)[4],
                                          int (&b)[4]) {
-    a[0] = dec_pair<0>(s.x, q0, basew); a[1] = dec_pair<1>(s.x, q0, basew);
-    a[2] = dec_pair<2>(s.y, q0, basew); a[3] = dec_pair<3>(s.y, q0, basew);
-    b[0] = dec_pair<0>(s.z, q1, basew); b[1] = dec_pair<1>(s.z, q1, basew);
-    b[2] = dec_pair<2>(s.w, q1, basew); b[3] = dec_pair<3>(s.w, q1, basew);
+    const uint32_t T0 = base * 0x01010101u + 0x03020100u, T1 = T0 + 0x04040404u;
+    c12_row(s.x, s.y, q0, T0, T1, a);
+    c12_row(s.z, s.w, q1, T0, T1, b);
 }
 
-struct C12 {  // pack_c12 "w12": per k block 768 bytes, 512 sign | mantissa (16 B per lane), then
+struct C12 {  // pack_c12 "w12": per k block 768 bytes, 512 low bytes (16 B per lane), then
               // 256 code bytes (8 B per lane)
     static constexpr int NK = 1, KB = 48;
     static constexpr bool EXC = true;
@@ -215,8 +219,8 @@ struct C12 {  // pack_c12 "w12": per k block 768 bytes, 512 sign | mantissa (16 
     }
 };
 
-struct C12W {  // pack_c12 "w12w": per 2 k blocks 1536 bytes, sign | mantissa of block 0 and of
-               // block 1 (16 B per lane each), then the codes of both (16 B per lane): 3 x 16 B loads
+struct C12W {  // pack_c12 "w12w": per 2 k blocks 1536 bytes, low bytes of block 0 and of block 1
+               // (16 B per lane each), then the codes of both (16 B per lane): 3 x 16 B loads
     static constexpr int NK = 2, KB = 96;
     static constexpr bool EXC = true;
     struct Raw { int4 s0, s1, q; };
@@ -237,7 +241,7 @@ struct C12W {  // pack_c12 "w12w": per 2 k blocks 1536 bytes, sign | mantissa of
 // (row stride KX; W column k meets x column k % KX, which lets the router read [hi | lo]).
 // Formats with EXC: esc is this warp's escape list (pack_escapes in Python): up to 32 entries, one
 // per lane, sorted by seq = k block index within the warp * RT + rt: seq << 17 | lane << 12 |
-// register << 9 | half << 8 | the 8-bit XOR that turns the decoded exponent into the true one
+// register << 9 | half << 8 | the 7-bit XOR that turns the decoded high exponent bits into the true ones
 // (0xFFFFFFFF ends the list). The owning lane patches its decoded register before the MMA.
 // DIAG (timing probes only, wrong results): 1 no decode, 2 no escapes, 4 no MMA, 8 no x loads.
 template <class F, int RT, int MT, int U, int DIAG = 0>
@@ -294,7 +298,7 @@ __device__ __forceinline__ void mainloop(float (&acc)[RT][MT][4], const int4* wq
                     const uint32_t seq = (uint32_t)((st.s * U + u) * RT + rt);
                     while ((nxt >> 17) == seq) {  // nxt is the same in all lanes: no divergence
                         if (lane == (int)((nxt >> 12) & 31)) {
-                            const uint32_t reg = (nxt >> 9) & 7, xr = (nxt & 0xFF) << (7 + ((nxt >> 8) & 1) * 16);
+                            const uint32_t reg = (nxt >> 9) & 7, xr = (nxt & 0x7F) << (8 + ((nxt >> 8) & 1) * 16);
 #pragma unroll
                             for (int i = 0; i < 4; ++i) {
                                 if (reg == (uint32_t)i) a[i] ^= xr;
@@ -695,40 +699,43 @@ def _stream(state, layer, n, kind, rt, u, ks, g):
 def pack_c12(w):
     """BF16 [N, K] -> lossless 12-bit code (C12 and C12W formats) and its escapes.
 
-    base = (largest exponent field) - 15. A value with exponent e in [base, base + 15] keeps its
-    sign and 7 mantissa bits as one byte and stores e - base as a 4-bit code. A value below the
-    window (tiny values, zeros; about 1e-4 of Gaussian weights) is an escape: code 0 (so it
-    decodes with exponent base) plus a list entry with the XOR base ^ e (pack_escapes), which the
-    kernel applies to the decoded register before the MMA. So the kernel multiplies exactly W.
-    Per 16-row tile and 32-wide k block, lane 4g + t holds 16 sign | mantissa bytes (row g then
-    row g + 8, k 8t .. 8t + 7) and 8 code bytes: one 32-bit word per row, pair j (k 2j, 2j + 1)
-    at nibbles j and j + 4.
-      w12:  per k block 768 bytes: the 512 sign | mantissa bytes, then the 256 code bytes;
-      w12w: per 2 k blocks 1536 bytes: sign | mantissa of both blocks, then 16 code bytes per lane.
+    Split each value into its low byte (bf16 bits 0-7: exponent LSB and 7 mantissa bits), its
+    7 high exponent bits eh (bits 8-14) and its sign. base = the start of the 8-wide eh window that
+    holds the most values (16 exponents). A value keeps its low byte and a nibble: eh - base in
+    bits 0-2, plus one sign bit in bit 3 (nibbles 0, 4, 1, 5, 2, 6, 3, 7 carry the signs of values
+    0..7 of a row's 8, see c12_row). A value outside the window (tiny values, zeros; about 1e-4 of
+    Gaussian weights) is an escape: index 0, so it decodes with eh = base, plus a list entry with
+    the XOR base ^ eh (pack_escapes) that the kernel applies to the decoded register before the
+    MMA. So the kernel multiplies exactly W.
+    Per 16-row tile and 32-wide k block, lane 4g + t holds 16 low bytes (row g then row g + 8,
+    k 8t .. 8t + 7) and 8 code bytes, one 32-bit word per row.
+      w12:  per k block 768 bytes: the 512 low bytes, then the 256 code bytes;
+      w12w: per 2 k blocks 1536 bytes: low bytes of both blocks, then 16 code bytes per lane.
     """
     n, k = w.shape
     tiles, nb = n // 16, k // 32
     bits = w.contiguous().view(torch.int16).to(torch.int32) & 0xFFFF
-    e = (bits >> 7) & 0xFF
-    base = max(int(e.max()) - 15, 0)
-    exc = e < base
-    code = torch.where(exc, 0, e - base)
-    sm = ((bits >> 8) & 0x80) | (bits & 0x7F)
+    eh, sign = (bits >> 8) & 0x7F, bits >> 15
+    window = torch.bincount(eh.flatten(), minlength=128).cumsum(0)
+    base = int(torch.argmax(window[7:] - torch.cat([window.new_zeros(1), window[:-8]])))  # window base .. base + 7
+    d = eh - base
+    exc = (d < 0) | (d >= 8)
+    nib = torch.where(exc, 0, d)
 
     def frag(a):  # [N, K] -> [tile, k block, g, t, row half, 8 values]
         return a.view(tiles, 2, 8, nb, 4, 8).permute(0, 3, 2, 4, 1, 5)
 
-    c = frag(code)[..., [0, 2, 4, 6, 1, 3, 5, 7]]  # nibble order inside each 32-bit word
-    sm_b = frag(sm).to(torch.uint8).reshape(tiles, nb, 512)
-    ex_b = (c[..., 0::2] | (c[..., 1::2] << 4)).to(torch.uint8).reshape(tiles, nb, 32, 8)
+    nib = frag(nib) | (frag(sign)[..., [0, 2, 4, 6, 1, 3, 5, 7]] << 3)  # nibble p: index p, sign of value inv[p]
+    lo_b = frag(bits & 0xFF).to(torch.uint8).reshape(tiles, nb, 512)
+    ex_b = (nib[..., 0::2] | (nib[..., 1::2] << 4)).to(torch.uint8).reshape(tiles, nb, 32, 8)
     rows, cols = exc.nonzero(as_tuple=True)
     return {
-        "w12": torch.cat([sm_b, ex_b.reshape(tiles, nb, 256)], 2).contiguous(),
-        "w12w": torch.cat([sm_b.reshape(tiles, nb // 2, 1024),
+        "w12": torch.cat([lo_b, ex_b.reshape(tiles, nb, 256)], 2).contiguous(),
+        "w12w": torch.cat([lo_b.reshape(tiles, nb // 2, 1024),
                            ex_b.reshape(tiles, nb // 2, 2, 32, 8).transpose(2, 3).reshape(tiles, nb // 2, 512)],
                           2).contiguous(),
-        "exc_rows": rows.long(), "exc_cols": cols.long(), "exc_xor": (e[rows, cols] ^ base).long(), "k": k,
-        "basew": base << 7 | base << 23,
+        "exc_rows": rows.long(), "exc_cols": cols.long(), "exc_xor": (eh[rows, cols] ^ base).long(), "k": k,
+        "basew": base,
     }
 
 
@@ -736,7 +743,7 @@ def pack_escapes(c, n, rt, u, ks, g):
     """Per-warp escape lists for ksplit_kernel with (rt, u, ks, warp grid g) on rows 0 .. n - 1:
     int32 [G * 32], warp gw's entries at gw * 32 .., sorted by seq = (k block within the warp) * rt
     + tile within the warp, padded with -1. Entry: seq << 17 | lane << 12 | register << 9 |
-    half << 8 | XOR of the exponent field. Raises ValueError if a warp needs more than 32."""
+    half << 8 | 7-bit XOR of the high exponent bits. Raises ValueError if a warp needs more than 32."""
     wr_n, wk_n = GEOMS[g]
     keep = c["exc_rows"] < n
     rows, cols, xr = c["exc_rows"][keep], c["exc_cols"][keep], c["exc_xor"][keep]
@@ -911,8 +918,9 @@ def _c12_probe(state, layer, n):
     """One-hot rows of x at columns that hold exceptions (values below the code's window), and
     W[:n] at those columns: the kernel's output must equal it bit for bit."""
     w = state[layer][:n]
-    base = (state["c12"][layer]["basew"] >> 7) & 0xFF
-    exc = ((w.view(torch.int16).to(torch.int32) >> 7) & 0xFF) < base
+    base = state["c12"][layer]["basew"]
+    eh = (w.view(torch.int16).to(torch.int32) >> 8) & 0x7F
+    exc = (eh < base) | (eh >= base + 8)
     cols = torch.cat([exc.nonzero()[:, 1].unique(), torch.arange(32, device=w.device)])[:32]
     x = torch.zeros((32, w.shape[1]), device=w.device, dtype=torch.bfloat16)
     x[torch.arange(32, device=w.device), cols] = 1.0
@@ -936,7 +944,7 @@ def _sweep(state, budget_s=150.0):
     for layer, c in state["c12"].items():
         if c is not None:
             n_exc = _c12_probe(state, layer, state[layer].shape[0])[2]
-            print(f"C12 {layer}: base exponent {(c['basew'] >> 7) & 0xFF}, {n_exc} exceptions", flush=True)
+            print(f"C12 {layer}: table base {c['basew']}, {n_exc} escapes", flush=True)
     l2 = torch.cuda.get_device_properties(0).L2_cache_size
     flush = torch.empty(max(4 * l2, 256 << 20) // 4, device=dev, dtype=torch.float32).fill_(1.0)
     gen = torch.Generator(device=dev).manual_seed(1)
