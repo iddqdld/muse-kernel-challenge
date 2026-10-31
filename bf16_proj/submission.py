@@ -31,7 +31,7 @@ from typing import TypedDict
 import torch
 import torch.nn.functional as F
 
-BENCH = True
+BENCH = False
 
 
 class Weights(TypedDict):
@@ -635,8 +635,7 @@ void diag(torch::Tensor x, torch::Tensor w, torch::Tensor exc, torch::Tensor out
 # only the "lt" variants are lost). An algorithm is 9 ints: ID, TILE_ID, SPLITK_NUM, REDUCTION_SCHEME,
 # CTA_SWIZZLING, CUSTOM_OPTION, STAGES_ID, INNER_SHAPE_ID, CLUSTER_SHAPE_ID. Layouts of out = x @ W^T:
 # 0: W [N, K] as A (transposed), x as B, column-major; 2: W^T [K, N] as A, x as B, column-major;
-# 3: row-major x [M, K] @ W^T [K, N]. BF16 in, FP32 accumulation; the C/D type follows out
-# (BF16 for the projections, FP32 for the router kinds lt_hl / lt_k16).
+# 3: row-major x [M, K] @ W^T [K, N]. BF16 in and out, FP32 accumulation.
 LT_SRC = r"""
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -649,26 +648,10 @@ static cublasLtHandle_t lt_handle() {
     return h;
 }
 
-// C and D carry whatever out is: BF16 for the projections, FP32 for the router (hi + lo halves).
-static cudaDataType_t lt_out_type(const torch::Tensor& out) {
-    const auto st = out.scalar_type();
-    TORCH_CHECK(st == at::kFloat || st == at::kBFloat16, "lt: out must be fp32 or bf16");
-    return st == at::kFloat ? CUDA_R_32F : CUDA_R_16BF;
-}
-
-// A and B are always the BF16 operands; the GEMM must match k and n in the layout's orientation.
-static void lt_check(const torch::Tensor& x, const torch::Tensor& w, const torch::Tensor& out, int64_t layout) {
-    const int64_t m = x.size(0), k = x.size(1), n = out.size(1);
-    TORCH_CHECK(x.scalar_type() == at::kBFloat16 && w.scalar_type() == at::kBFloat16, "lt: x and w must be bf16");
-    TORCH_CHECK(out.size(0) == m, "lt: out rows ", out.size(0), " != x rows ", m);
-    TORCH_CHECK(w.dim() == 2 && (layout == 0 ? (w.size(0) == n && w.size(1) == k) : (w.size(0) == k && w.size(1) == n)),
-                "lt: layout ", layout, " w ", w.sizes(), " does not fit k=", k, " n=", n);
-}
-
 struct LtMats {
     cublasLtMatmulDesc_t op = nullptr;
     cublasLtMatrixLayout_t a = nullptr, b = nullptr, d = nullptr;
-    LtMats(int layout, int64_t m, int64_t n, int64_t k, cudaDataType_t dt) {
+    LtMats(int layout, int64_t m, int64_t n, int64_t k) {
         cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F);
         const cublasOperation_t ta = layout == 0 ? CUBLAS_OP_T : CUBLAS_OP_N, tb = CUBLAS_OP_N;
         cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta));
@@ -676,14 +659,14 @@ struct LtMats {
         if (layout == 3) {
             cublasLtMatrixLayoutCreate(&a, CUDA_R_16BF, m, k, k);
             cublasLtMatrixLayoutCreate(&b, CUDA_R_16BF, k, n, n);
-            cublasLtMatrixLayoutCreate(&d, dt, m, n, n);
+            cublasLtMatrixLayoutCreate(&d, CUDA_R_16BF, m, n, n);
             const cublasLtOrder_t row = CUBLASLT_ORDER_ROW;
             for (auto l : {a, b, d}) cublasLtMatrixLayoutSetAttribute(l, CUBLASLT_MATRIX_LAYOUT_ORDER, &row, sizeof(row));
         } else {
             if (layout == 0) cublasLtMatrixLayoutCreate(&a, CUDA_R_16BF, k, n, k);
             else cublasLtMatrixLayoutCreate(&a, CUDA_R_16BF, n, k, n);
             cublasLtMatrixLayoutCreate(&b, CUDA_R_16BF, k, m, k);
-            cublasLtMatrixLayoutCreate(&d, dt, n, m, n);
+            cublasLtMatrixLayoutCreate(&d, CUDA_R_16BF, n, m, n);
         }
     }
     ~LtMats() {
@@ -704,12 +687,10 @@ void lt_run(torch::Tensor x, torch::Tensor w, torch::Tensor out, int64_t layout,
             torch::Tensor ws) {
     const int64_t m = x.size(0), k = x.size(1), n = out.size(1);
     TORCH_CHECK(cfg.size() == 9 && x.is_contiguous() && w.is_contiguous() && out.is_contiguous());
-    lt_check(x, w, out, layout);
-    const cudaDataType_t dt = lt_out_type(out);
-    LtMats L((int)layout, m, n, k, dt);
+    LtMats L((int)layout, m, n, k);
     cublasLtMatmulAlgo_t algo;
     TORCH_CHECK(cublasLtMatmulAlgoInit(lt_handle(), CUBLAS_COMPUTE_32F, CUDA_R_32F, CUDA_R_16BF, CUDA_R_16BF,
-                                       dt, dt, (int)cfg[0], &algo) == CUBLAS_STATUS_SUCCESS,
+                                       CUDA_R_16BF, CUDA_R_16BF, (int)cfg[0], &algo) == CUBLAS_STATUS_SUCCESS,
                 "lt: algo init");
     for (int i = 1; i < 9; ++i) {
         const uint32_t v32 = (uint32_t)cfg[i];
@@ -731,8 +712,7 @@ void lt_run(torch::Tensor x, torch::Tensor w, torch::Tensor out, int64_t layout,
 std::vector<int64_t> lt_algos(torch::Tensor x, torch::Tensor w, torch::Tensor out, int64_t layout, torch::Tensor ws,
                               int64_t count) {
     const int64_t m = x.size(0), k = x.size(1), n = out.size(1);
-    lt_check(x, w, out, layout);
-    LtMats L((int)layout, m, n, k, lt_out_type(out));
+    LtMats L((int)layout, m, n, k);
     cublasLtMatmulPreference_t pref;
     cublasLtMatmulPreferenceCreate(&pref);
     const uint64_t bytes = ws.numel();
@@ -767,10 +747,6 @@ LT_SEEDS = {
     ("unpooler", 256): [(3, 66, 20, 1, 0, 0, 4, 35, 0, 2)],
     ("qkv_gate", 256): [(0, 66, 124, 1, 0, 0, 0, 35, 0, 2)],
 }
-# Router cuBLASLt kinds: FP32 out (the router's hi + lo halves). kind -> (out width, W [N, K] layout 0,
-# W^T [K, N] layouts 2 and 3). lt_hl stacks hi/lo as rows and adds the halves; lt_k16 reads the same
-# [hi | lo] weights with x twice in k, so no add. Algorithm IDs differ from the BF16-D ones: never seed.
-ROUTER_LT = {"lt_hl": (512, "router_hl", "router_hl_t"), "lt_k16": (256, "router_hilo", "router_hilo_t")}
 _LT = None
 
 
@@ -1050,40 +1026,6 @@ def _lt_variants(state, layer, m, n):
     return [("lt", c) for c in dict.fromkeys(found + LT_SEEDS.get((layer, m), []))]
 
 
-def _lt_router(kind, x, state, cfg):
-    """Router cuBLASLt with FP32 out. lt_hl: one [m, 512] GEMM over the stacked hi/lo W rows, then the
-    hi + lo add (no split-K reduce); lt_k16: one [m, 256] GEMM over [hi | lo] with x twice in k (no add)."""
-    mod = _lt_mod()
-    if mod is None:  # an "lt_*" label must never fall through to _torch
-        raise RuntimeError("cuBLASLt module unavailable")
-    nout, w0, w2 = ROUTER_LT[kind]
-    w = state[w0 if cfg[0] == 0 else w2]
-    xin = x if kind == "lt_hl" else torch.cat([x, x], dim=1)
-    out = _out(x, "router", nout)
-    mod.lt_run(xin, w, out, cfg[0], list(cfg[1:]), state["lt_ws"])
-    if kind == "lt_k16":
-        return out
-    h = out.shape[1] // 2
-    return out[:, :h] + out[:, h:]
-
-
-def _router_lt_variants(state, m):
-    """Time each router heuristic and its unsplit variant; the heuristic can return only split-K algorithms."""
-    x = torch.zeros((m, state["router"].shape[1]), device=state["router"].device, dtype=torch.bfloat16)
-    found = []
-    for kind, (nout, w0, w2) in ROUTER_LT.items():
-        xin = x if kind == "lt_hl" else torch.cat([x, x], dim=1)
-        for layout in (0, 2, 3):
-            w = state[w0 if layout == 0 else w2]
-            flat = _lt_mod().lt_algos(xin, w, _out(x, "router", nout), layout, state["lt_ws"], 8)
-            found += [(kind, (layout, *flat[i:i + 9])) for i in range(0, len(flat), 9)]
-    candidates = dict.fromkeys(found)
-    for kind, cfg in found:
-        candidates[(kind, cfg[:3] + (1, 0) + cfg[5:])] = None  # splitK=1, no reduction
-    print(f"BENCH router m={m} lt heuristics={len(found)} candidates={len(candidates)}", flush=True)
-    return list(candidates)
-
-
 def _run(kind, cfg, x, state, layer, n):
     if kind in ("cuda", "c12", "c12w") and _MOD:
         if not kind.startswith("c12") or state["c12"].get(layer) is not None:
@@ -1094,10 +1036,6 @@ def _run(kind, cfg, x, state, layer, n):
         return out
     if kind == "lt" and _lt_mod():
         return _lt(x, state, layer, n, cfg)
-    if kind in ("lt_hl", "lt_k16"):  # router kinds: raises if the module is missing, never _torch
-        if layer != "router":
-            raise ValueError(f"{kind} only applies to the router, not {layer}")
-        return _lt_router(kind, x, state, cfg)
     if kind in ("mm_t", "mm_n", "mm_s", "mm_st"):
         return _mm(kind, x, state, layer, n)
     return _torch(x, state, layer, n)
@@ -1116,7 +1054,7 @@ def prepare(weights: Weights):
     state["router_hl_t"] = state["router_hl"].t().contiguous()
     if BENCH or any(kind in ("mm_t", "lt") for kind, _ in PLAN.values()):
         state["wt"] = {name: state[name].t().contiguous() for name in ("qkv_gate", "o", "pooler", "unpooler")}
-    if BENCH or any(kind in ("lt", "lt_hl", "lt_k16") for kind, _ in PLAN.values()):
+    if BENCH or any(kind == "lt" for kind, _ in PLAN.values()):
         state["lt_ws"] = torch.empty(32 << 20, device=dev, dtype=torch.uint8)  # cuBLASLt workspace
     state["plan"] = dict(PLAN)
     state["units"] = {name: pack_weight(state[name]) for name in ("qkv_gate", "o", "pooler", "unpooler")}
@@ -1134,22 +1072,17 @@ def prepare(weights: Weights):
                 _stream(state, layer, n, "cuda", *cfg)
     if BENCH or any(kind != "torch" for kind, _ in PLAN.values()):
         _cuda()
-    if BENCH or any(kind in ("lt", "lt_hl", "lt_k16") for kind, _ in PLAN.values()):
+    if BENCH or any(kind == "lt" for kind, _ in PLAN.values()):
         _lt_mod()
     for (layer, m), (kind, cfg) in list(state["plan"].items()):  # a planned cuBLASLt algorithm must run here
-        if kind not in ("lt", "lt_hl", "lt_k16"):
-            continue
-        try:
-            if kind == "lt":  # projections, and the router's [hi | lo] GEMM at k = 2 * 8192
+        if kind == "lt":
+            try:
                 _lt(torch.zeros((m, state[layer].shape[1]), device=dev, dtype=torch.bfloat16), state, layer,
                     state[layer].shape[0], cfg)
-            else:  # router: lt_hl [m, 512] then the add, lt_k16 [m, 256] with x twice in k
-                _run(kind, cfg, torch.zeros((m, state["router"].shape[1]), device=dev, dtype=torch.bfloat16),
-                     state, layer, ROUTER_LT[kind][0])
-            torch.cuda.synchronize()
-        except Exception as e:  # noqa: BLE001 - fall back to SGLang's dispatch / mm_st, and say why
-            print(f"cuBLASLt {layer} m={m} {kind}{cfg} unusable: {str(e)[:200]}", flush=True)
-            state["plan"][(layer, m)] = ("mm_st", None) if layer == "router" else ("torch", None)
+                torch.cuda.synchronize()
+            except Exception as e:  # noqa: BLE001 - fall back to SGLang's dispatch, and say why
+                print(f"cuBLASLt {layer} m={m} {cfg} unusable: {str(e)[:200]}", flush=True)
+                state["plan"][(layer, m)] = ("torch", None)
     if BENCH:
         _env_report()
         _sweep(state)
@@ -1203,10 +1136,8 @@ def _variants(state, m, layer, n, k_w):
         out += [("mm_s", None), ("mm_st", None)] + ([("rs", None)] if m <= 8 else [])
     if PLAN.get((layer, m), ("torch",))[0] != "torch":
         out.append(PLAN[(layer, m)])
-    if m >= 32 and layer != "router" and _lt_mod():
+    if m >= 128 and layer != "router" and _lt_mod():
         out += _lt_variants(state, layer, m, n)
-    if layer == "router" and m >= 128 and _lt_mod():
-        out += _router_lt_variants(state, m)
     if not _MOD or (m > 32 and layer != "router"):  # token groups lost 3-7x to cuBLAS (check 45fd2ba0)
         return out
     has_c12 = state["c12"].get(layer) is not None
@@ -1313,15 +1244,14 @@ def _sweep(state, budget_s=150.0):
             load_t[m][1] += best
             t_torch = next(t for t, k, _ in results if k == "torch") - FIXED_US
             tag = {"cuda": "c", "c12": "z", "c12w": "w", "torch": "t", "mm_t": "T", "mm_n": "N", "mm_s": "S",
-                   "mm_st": "U", "rs": "R", "lt": "L", "lt_hl": "H", "lt_k16": "K"}
+                   "mm_st": "U", "rs": "R", "lt": "L"}
             top = " ".join(f"{t - FIXED_US:.2f}{tag[k]}{list(c) if c else ''}" for t, k, c in results[:3])
             rows.append(f"m={m:<3} {layer:<8} sgl={sgl:6.2f} torch={t_torch:6.2f} best={best:6.2f} "
                         f"x{sgl / max(best, 0.05):.2f} | {top}" + (f" | bad {' '.join(bad[:4])}" if bad else ""))
     ratios = [s / max(o, 0.05) for s, o in load_t.values()]
     est = math.exp(sum(math.log(r) for r in ratios) / len(ratios)) if ratios else 0.0
     print("BENCH net us (judge's 3.8us fixed cost removed); [rt,u,ksplit] of c=cuda z=c12 w=c12w; "
-          "t=SGLang dispatch, T/N=cuBLAS on W^T copy / W view, H/K=cuBLASLt router hi+lo add / k-concat",
-          flush=True)
+          "t=SGLang dispatch, T/N=cuBLAS on W^T copy / W view", flush=True)
     for r in rows:
         print("BENCH " + r, flush=True)
     print("BENCH loads " + " ".join(f"m={m}:x{s / max(o, 0.05):.2f}" for m, (s, o) in load_t.items())
