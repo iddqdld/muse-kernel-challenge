@@ -73,7 +73,7 @@ constexpr int U = 8;     // chunks per iteration: one int4 of block scales per l
 
 __device__ __forceinline__ int4 ld_stream(const void* p) {
     int4 v;
-    asm("ld.global.ca.v4.s32 {%0,%1,%2,%3}, [%4];"
+    asm("ld.global.nc.L1::no_allocate.v4.s32 {%0,%1,%2,%3}, [%4];"
         : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
     return v;
 }
@@ -88,11 +88,18 @@ __device__ __forceinline__ void mma_bf16(float* c, uint32_t a0, uint32_t a1, uin
 
 // E4M3 block scale byte -> BF16 (scale * 2^118) in both halves.
 __device__ __forceinline__ uint32_t scale2(uint32_t b) {
-    uint32_t h2;
-    const unsigned short dup = (unsigned short)(b | (b << 8));
-    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h2) : "h"(dup));
-    const float f = __half2float(__ushort_as_half((unsigned short)(h2 & 0xffffu))) * 0x1p118f;
-    const uint32_t u = __bfloat16_as_ushort(__float2bfloat16_rn(f));
+    const uint32_t m = b & 0x7fu, sign = (b & 0x80u) << 8;
+    uint32_t u;
+    if (m >= 8 && m < 127) {
+        u = sign | ((m << 4) + 0x7700u);
+    } else if (m == 127) {
+        u = sign | 0x7fc0u;
+    } else if (m == 0) {
+        u = sign;
+    } else {
+        const int h = 31 - __clz(m);
+        u = sign | ((236 + h) << 7) | (((m << (2 - h)) & 3u) << 5);
+    }
     return u | (u << 16);
 }
 
