@@ -73,7 +73,7 @@ constexpr int U = 8;     // chunks per iteration: one int4 of block scales per l
 
 __device__ __forceinline__ int4 ld_stream(const void* p) {
     int4 v;
-    asm("ld.global.nc.L1::no_allocate.v4.s32 {%0,%1,%2,%3}, [%4];"
+    asm("ld.global.ca.v4.s32 {%0,%1,%2,%3}, [%4];"
         : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
     return v;
 }
@@ -187,14 +187,14 @@ __device__ __forceinline__ void warp_tile(const int4* __restrict__ cp, const int
             dequant_lo(w[u], s_lo, s_hi, A);
 #pragma unroll
             for (int nt = 0; nt < MT; ++nt)
-                mma_lo(acc[nt], A, *reinterpret_cast<const int4*>(brow[nt] + u * 64));
+                mma_lo(acc[nt], A, __ldg(reinterpret_cast<const int4*>(brow[nt] + u * 64)));
         }
         {
             uint32_t A[2][4];
             dequant_hi(w[u], s_lo, s_hi, A);
 #pragma unroll
             for (int nt = 0; nt < MT; ++nt)
-                mma_hi(acc[nt], A, *(reinterpret_cast<const int4*>(brow[nt] + u * 64) + 1));
+                mma_hi(acc[nt], A, __ldg(reinterpret_cast<const int4*>(brow[nt] + u * 64) + 1));
         }
     }
 }
