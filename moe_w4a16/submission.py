@@ -161,7 +161,7 @@ __global__ void __launch_bounds__(1024) moe_route_kernel(const int* __restrict__
 }
 
 // One warp: NCHUNK chunks of one 16-row tile into acc, against the B rows brow (this lane's
-// row at its k offset, nullptr past the routes). All weight loads are issued first.
+// row at its k offset, the first route's row past the routes). All weight loads are issued first.
 template <int MT, int NCHUNK>
 __device__ __forceinline__ void warp_tile(const int4* __restrict__ cp, const int4* __restrict__ sp,
                                           const __nv_bfloat16* const (&brow)[MT], float (&acc)[MT][4]) {
@@ -177,13 +177,8 @@ __device__ __forceinline__ void warp_tile(const int4* __restrict__ cp, const int
         dequant_chunk(w[u], scale2(sw & 0xffu), scale2((sw >> 8) & 0xffu), A);
 #pragma unroll
         for (int nt = 0; nt < MT; ++nt) {
-            int4 b01 = make_int4(0, 0, 0, 0), b23 = b01;
-            if (brow[nt]) {
-                const int4* p = reinterpret_cast<const int4*>(brow[nt] + u * 64);
-                b01 = __ldg(p);
-                b23 = __ldg(p + 1);
-            }
-            mma_chunk(acc[nt], A, b01, b23);
+            const int4* p = reinterpret_cast<const int4*>(brow[nt] + u * 64);
+            mma_chunk(acc[nt], A, __ldg(p), __ldg(p + 1));
         }
     }
 }
@@ -217,7 +212,7 @@ __device__ __forceinline__ void up_item(const __nv_bfloat16* __restrict__ x, con
 #pragma unroll
     for (int nt = 0; nt < MT; ++nt) {
         const int i = nt * 8 + g;
-        brow[nt] = i < n ? x + (size_t)(routes[i] / TOPK) * H + q * (H / 4) + t * 16 : nullptr;
+        brow[nt] = x + (size_t)(routes[i < n ? i : 0] / TOPK) * H + q * (H / 4) + t * 16;
     }
     float acc[MT][4] = {};
     warp_tile<MT, NCH / 4>(codes + (tb * NCH + q * (NCH / 4)) * 32 + lane,
@@ -256,7 +251,7 @@ __device__ __forceinline__ void down_item(const __nv_bfloat16* __restrict__ act,
 #pragma unroll
     for (int nt = 0; nt < MT; ++nt) {
         const int i = nt * 8 + g;
-        brow[nt] = i < n ? act + (size_t)routes[i] * I + warp * (I / 8) + t * 16 : nullptr;
+        brow[nt] = act + (size_t)routes[i < n ? i : 0] * I + warp * (I / 8) + t * 16;
     }
     float acc[MT][4] = {};
     warp_tile<MT, NCH / 8>(codes + (tb * NCH + warp * (NCH / 8)) * 32 + lane,
