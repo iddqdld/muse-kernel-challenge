@@ -160,21 +160,24 @@ __global__ void __launch_bounds__(1024) moe_route_kernel(const int* __restrict__
     }
 }
 
-// One warp: NCHUNK chunks of one 16-row tile into acc, against the B rows brow (this lane's
-// row at its k offset, the first route's row past the routes). All weight loads are issued first.
+// Each warp holds eight packed weight chunks; the up GEMM refills a slot after dequantizing it.
 template <int MT, int NCHUNK>
 __device__ __forceinline__ void warp_tile(const int4* __restrict__ cp, const int4* __restrict__ sp,
                                           const __nv_bfloat16* const (&brow)[MT], float (&acc)[MT][4]) {
-    int4 w[NCHUNK], s[NCHUNK / U];
+    constexpr int NW = NCHUNK / U;
+    static_assert(NCHUNK % U == 0 && NW <= 2, "one or two weight windows");
+    int4 w[U], s[NW];
 #pragma unroll
-    for (int u = 0; u < NCHUNK; ++u) w[u] = ld_stream(cp + u * 32);
+    for (int u = 0; u < U; ++u) w[u] = ld_stream(cp + u * 32);
 #pragma unroll
-    for (int q = 0; q < NCHUNK / U; ++q) s[q] = ld_stream(sp + q * 32);
+    for (int q = 0; q < NW; ++q) s[q] = ld_stream(sp + q * 32);
 #pragma unroll
     for (int u = 0; u < NCHUNK; ++u) {
+        const int k = u % U;
         const uint32_t sw = reinterpret_cast<const uint32_t*>(&s[u / U])[(u % U) >> 1] >> ((u & 1) * 16);
         uint32_t A[4][4];
-        dequant_chunk(w[u], scale2(sw & 0xffu), scale2((sw >> 8) & 0xffu), A);
+        dequant_chunk(w[k], scale2(sw & 0xffu), scale2((sw >> 8) & 0xffu), A);
+        if (NW == 2 && u + U < NCHUNK) w[k] = ld_stream(cp + (u + U) * 32);
 #pragma unroll
         for (int nt = 0; nt < MT; ++nt) {
             const int4* p = reinterpret_cast<const int4*>(brow[nt] + u * 64);
