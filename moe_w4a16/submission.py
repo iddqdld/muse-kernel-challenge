@@ -292,7 +292,7 @@ __global__ void __launch_bounds__(256, 2) moe_up_kernel(
     }
 }
 
-__global__ void __launch_bounds__(256, 2) moe_down_kernel(
+__global__ void __launch_bounds__(256, 1) moe_down_kernel(
         const __nv_bfloat16* __restrict__ act, const int* __restrict__ meta, const int* __restrict__ list,
         int local_start, const int4* __restrict__ codes, const int4* __restrict__ scales,
         const float* __restrict__ gs, __nv_bfloat16* __restrict__ ybuf) {
