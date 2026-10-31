@@ -1,0 +1,89 @@
+CUDA compiled in 44s
+ENV gpu NVIDIA H200 sm90 sms=132 l2=60MB | torch 2.14.1+cu130
+C12 qkv_gate: base exponent 108, 2599 exceptions
+C12 o: base exponent 109, 820 exceptions
+C12 pooler: base exponent 108, 4576 exceptions
+C12 unpooler: base exponent 108, 3219 exceptions
+BENCH fail qkv_gate m=1 c12(1, 8, 1): c12_mma: invalid argument
+BENCH fail qkv_gate m=1 c12(1, 8, 2): c12_mma: invalid argument
+BENCH fail qkv_gate m=1 c12(1, 8, 4): c12_mma: invalid argument
+BENCH fail qkv_gate m=1 c12(2, 4, 1): c12_mma: invalid argument
+BENCH fail qkv_gate m=1 c12(2, 4, 2): c12_mma: invalid argument
+BENCH fail qkv_gate m=1 c12(2, 4, 4): c12_mma: invalid argument
+BENCH fail qkv_gate m=1 c12(2, 4, 8): c12_mma: invalid argument
+BENCH fail o m=1 c12(2, 4, 1): c12_mma: invalid argument
+BENCH fail pooler m=1 c12(1, 8, 1): c12_mma: invalid argument
+BENCH fail pooler m=1 c12(1, 8, 2): c12_mma: invalid argument
+BENCH fail pooler m=1 c12(1, 8, 4): c12_mma: invalid argument
+BENCH fail pooler m=1 c12(2, 4, 1): c12_mma: invalid argument
+BENCH fail pooler m=1 c12(2, 4, 2): c12_mma: invalid argument
+BENCH fail pooler m=1 c12(2, 4, 4): c12_mma: invalid argument
+BENCH fail pooler m=1 c12(2, 4, 8): c12_mma: invalid argument
+BENCH fail unpooler m=1 c12(1, 8, 1): c12_mma: invalid argument
+BENCH fail unpooler m=1 c12(1, 8, 2): c12_mma: invalid argument
+BENCH fail unpooler m=1 c12(2, 4, 2): c12_mma: invalid argument
+BENCH fail unpooler m=1 c12(2, 4, 4): c12_mma: invalid argument
+BENCH fail qkv_gate m=8 c12(1, 8, 1): c12_mma: invalid argument
+BENCH fail qkv_gate m=8 c12(1, 8, 2): c12_mma: invalid argument
+BENCH fail qkv_gate m=8 c12(1, 8, 4): c12_mma: invalid argument
+BENCH fail qkv_gate m=8 c12(2, 4, 1): c12_mma: invalid argument
+BENCH fail qkv_gate m=8 c12(2, 4, 2): c12_mma: invalid argument
+BENCH fail qkv_gate m=8 c12(2, 4, 4): c12_mma: invalid argument
+BENCH fail qkv_gate m=8 c12(2, 4, 8): c12_mma: invalid argument
+BENCH fail o m=8 c12(2, 4, 1): c12_mma: invalid argument
+BENCH fail pooler m=8 c12(1, 8, 1): c12_mma: invalid argument
+BENCH fail pooler m=8 c12(1, 8, 2): c12_mma: invalid argument
+BENCH fail pooler m=8 c12(1, 8, 4): c12_mma: invalid argument
+BENCH fail pooler m=8 c12(2, 4, 1): c12_mma: invalid argument
+BENCH fail pooler m=8 c12(2, 4, 2): c12_mma: invalid argument
+BENCH fail pooler m=8 c12(2, 4, 4): c12_mma: invalid argument
+BENCH fail pooler m=8 c12(2, 4, 8): c12_mma: invalid argument
+BENCH fail unpooler m=8 c12(1, 8, 1): c12_mma: invalid argument
+BENCH fail unpooler m=8 c12(1, 8, 2): c12_mma: invalid argument
+BENCH fail unpooler m=8 c12(2, 4, 2): c12_mma: invalid argument
+BENCH fail unpooler m=8 c12(2, 4, 4): c12_mma: invalid argument
+BENCH fail qkv_gate m=16 c12(2, 4, 1): c12_mma: invalid argument
+BENCH fail qkv_gate m=16 c12(2, 4, 2): c12_mma: invalid argument
+BENCH fail qkv_gate m=16 c12(2, 4, 4): c12_mma: invalid argument
+BENCH fail qkv_gate m=16 c12(2, 4, 8): c12_mma: invalid argument
+BENCH fail o m=16 c12(2, 4, 1): c12_mma: invalid argument
+BENCH fail pooler m=16 c12(2, 4, 1): c12_mma: invalid argument
+BENCH fail pooler m=16 c12(2, 4, 2): c12_mma: invalid argument
+BENCH fail pooler m=16 c12(2, 4, 4): c12_mma: invalid argument
+BENCH fail pooler m=16 c12(2, 4, 8): c12_mma: invalid argument
+BENCH fail unpooler m=16 c12(2, 4, 1): c12_mma: invalid argument
+BENCH fail unpooler m=16 c12(2, 4, 2): c12_mma: invalid argument
+BENCH fail unpooler m=16 c12(2, 4, 4): c12_mma: invalid argument
+BENCH net us (judge's 3.8us fixed cost removed); c=cuda[rt,u,ksplit] z=c12[rt,u,ksplit] t=torch
+BENCH m=1   qkv_gate sgl= 13.32 torch= 13.35 best= 11.43 x1.17 | 11.43c[1, 4, 1] 11.82c[1, 2, 2] 11.98c[2, 2, 2] | bad c12(1, 8, 1):RuntimeError c12(1, 8, 2):RuntimeError c12(1, 8, 4):RuntimeError c12(2, 4, 1):RuntimeError
+BENCH m=1   o        sgl=  6.50 torch=  6.47 best=  5.83 x1.12 | 5.83c[2, 2, 1] 5.90c[1, 2, 1] 6.09z[2, 2, 1] | bad c12(2, 4, 1):RuntimeError
+BENCH m=1   pooler   sgl= 20.52 torch= 20.42 best= 16.39 x1.25 | 16.39z[1, 4, 1] 16.90c[1, 4, 1] 17.32c[1, 2, 1] | bad c12(1, 8, 1):RuntimeError c12(1, 8, 2):RuntimeError c12(1, 8, 4):RuntimeError c12(2, 4, 1):RuntimeError
+BENCH m=1   unpooler sgl=  7.14 torch=  7.02 best=  4.84 x1.48 | 4.84c[1, 8, 1] 5.03c[1, 4, 1] 5.19c[1, 8, 2] | bad c12(1, 8, 1):RuntimeError c12(1, 8, 2):RuntimeError c12(2, 4, 2):RuntimeError c12(2, 4, 4):RuntimeError
+BENCH m=1   router   sgl= 11.14 torch= 15.72 best=  5.77 x1.93 | 5.77c[1, 8, 4] 5.83c[1, 4, 8] 6.02c[1, 4, 4]
+BENCH m=8   qkv_gate sgl= 13.80 torch= 13.99 best= 12.07 x1.14 | 12.07c[1, 2, 2] 12.10c[1, 4, 1] 12.39c[2, 2, 2] | bad c12(1, 8, 1):RuntimeError c12(1, 8, 2):RuntimeError c12(1, 8, 4):RuntimeError c12(2, 4, 1):RuntimeError
+BENCH m=8   o        sgl=  6.31 torch=  6.09 best=  5.99 x1.05 | 5.99c[1, 2, 1] 6.02c[2, 2, 1] 6.09t | bad c12(2, 4, 1):RuntimeError
+BENCH m=8   pooler   sgl= 20.65 torch= 20.78 best= 16.84 x1.23 | 16.84z[1, 4, 1] 17.13z[1, 2, 1] 17.22c[1, 4, 1] | bad c12(1, 8, 1):RuntimeError c12(1, 8, 2):RuntimeError c12(1, 8, 4):RuntimeError c12(2, 4, 1):RuntimeError
+BENCH m=8   unpooler sgl=  7.14 torch=  6.95 best=  4.81 x1.49 | 4.81c[1, 8, 1] 5.03c[1, 4, 1] 5.13c[1, 2, 4] | bad c12(1, 8, 1):RuntimeError c12(1, 8, 2):RuntimeError c12(2, 4, 2):RuntimeError c12(2, 4, 4):RuntimeError
+BENCH m=8   router   sgl= 26.73 torch= 15.53 best=  5.90 x4.53 | 5.90c[1, 8, 4] 6.02c[1, 4, 8] 6.34c[1, 4, 4]
+BENCH m=16  qkv_gate sgl= 14.31 torch= 14.25 best= 13.67 x1.05 | 13.67c[2, 4, 1] 14.25t 14.28c[2, 2, 2] | bad c12(2, 4, 1):RuntimeError c12(2, 4, 2):RuntimeError c12(2, 4, 4):RuntimeError c12(2, 4, 8):RuntimeError
+BENCH m=16  o        sgl=  6.18 torch=  6.22 best=  6.22 x0.99 | 6.22t 6.76c[2, 2, 1] 7.21z[2, 2, 1] | bad c12(2, 4, 1):RuntimeError
+BENCH m=16  pooler   sgl= 20.87 torch= 20.68 best= 18.41 x1.13 | 18.41c[1, 2, 1] 18.63c[2, 4, 1] 18.79c[2, 2, 2] | bad c12(2, 4, 1):RuntimeError c12(2, 4, 2):RuntimeError c12(2, 4, 4):RuntimeError c12(2, 4, 8):RuntimeError
+BENCH m=16  unpooler sgl= 17.90 torch= 17.93 best= 17.64 x1.01 | 17.64z[2, 2, 1] 17.93t 17.99c[2, 2, 1] | bad c12(2, 4, 1):RuntimeError c12(2, 4, 2):RuntimeError c12(2, 4, 4):RuntimeError
+BENCH m=16  router   sgl= 16.30 torch= 16.33 best=  6.92 x2.35 | 6.92c[1, 4, 4] 7.21c[1, 2, 8] 7.88c[2, 4, 8]
+BENCH m=32  qkv_gate sgl= 14.47 torch= 14.63 best= 14.63 x0.99 | 14.63t 18.15c[2, 2, 1] 21.67c[1, 2, 1]
+BENCH m=32  o        sgl=  6.38 torch=  6.38 best=  6.38 x1.00 | 6.38t 9.32c[2, 2, 1] 9.51c[1, 2, 1]
+BENCH m=32  pooler   sgl= 21.42 torch= 21.51 best= 21.51 x1.00 | 21.51t 21.80c[2, 2, 1] 22.79c[1, 2, 1]
+BENCH m=32  unpooler sgl= 18.02 torch= 17.96 best= 17.96 x1.00 | 17.96t 23.88c[2, 2, 1] 24.49c[1, 2, 1]
+BENCH m=32  router   sgl= 16.46 torch= 16.36 best=  9.10 x1.81 | 9.10c[1, 4, 4] 9.77c[1, 2, 8] 10.76c[1, 2, 4]
+BENCH m=128 qkv_gate sgl= 16.62 torch= 16.55 best= 16.55 x1.00 | 16.55t
+BENCH m=128 o        sgl=  7.08 torch=  6.86 best=  6.86 x1.03 | 6.86t
+BENCH m=128 pooler   sgl= 24.87 torch= 24.84 best= 24.84 x1.00 | 24.84t
+BENCH m=128 unpooler sgl= 18.89 torch= 19.11 best= 19.11 x0.99 | 19.11t
+BENCH m=128 router   sgl= 17.32 torch= 17.29 best= 17.29 x1.00 | 17.29t 22.79c[1, 2, 4] 25.61c[1, 4, 4]
+BENCH m=256 qkv_gate sgl= 19.30 torch= 19.08 best= 19.08 x1.01 | 19.08t
+BENCH m=256 o        sgl=  8.81 torch=  8.81 best=  8.81 x1.00 | 8.81t
+BENCH m=256 pooler   sgl= 32.20 torch= 30.25 best= 30.25 x1.06 | 30.25t
+BENCH m=256 unpooler sgl= 23.82 torch= 23.78 best= 23.78 x1.00 | 23.78t
+BENCH m=256 router   sgl= 18.28 torch= 18.47 best= 18.47 x0.99 | 18.47t 36.26c[1, 2, 4] 44.33c[1, 4, 4]
+BENCH loads m=1:x1.32 m=8:x1.64 m=16:x1.20 m=32:x1.10 m=128:x1.00 m=256:x1.02 | est speedup x1.197 | sweep 11s
+PLAN = {('qkv_gate', 1): ('cuda', (1, 4, 1)), ('qkv_gate', 8): ('cuda', (1, 2, 2)), ('qkv_gate', 16): ('cuda', (2, 4, 1)), ('qkv_gate', 32): ('torch', None), ('qkv_gate', 128): ('torch', None), ('qkv_gate', 256): ('torch', None), ('o', 1): ('cuda', (2, 2, 1)), ('o', 8): ('cuda', (1, 2, 1)), ('o', 16): ('torch', None), ('o', 32): ('torch', None), ('o', 128): ('torch', None), ('o', 256): ('torch', None), ('pooler', 1): ('c12', (1, 4, 1)), ('pooler', 8): ('c12', (1, 4, 1)), ('pooler', 16): ('cuda', (1, 2, 1)), ('pooler', 32): ('torch', None), ('pooler', 128): ('torch', None), ('pooler', 256): ('torch', None), ('unpooler', 1): ('cuda', (1, 8, 1)), ('unpooler', 8): ('cuda', (1, 8, 1)), ('unpooler', 16): ('c12', (2, 2, 1)), ('unpooler', 32): ('torch', None), ('unpooler', 128): ('torch', None), ('unpooler', 256): ('torch', None), ('router', 1): ('cuda', (1, 8, 4)), ('router', 8): ('cuda', (1, 8, 4)), ('router', 16): ('cuda', (1, 4, 4)), ('router', 32): ('cuda', (1, 4, 4)), ('router', 128): ('torch', None), ('router', 256): ('torch', None)}
