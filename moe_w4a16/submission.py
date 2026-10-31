@@ -87,12 +87,6 @@ __device__ __forceinline__ void mma_bf16(float* c, uint32_t a0, uint32_t a1, uin
 
 // E4M3 block scale byte -> BF16 (scale * 2^118) in both halves.
 __device__ __forceinline__ uint32_t scale2(uint32_t b) {
-    // Normal E4M3 values fit BF16 exactly after the exponent offset.
-    if ((b & 0x78u) && ((b & 0x7fu) != 0x7fu)) {
-        const uint32_t u = ((b & 0x80u) << 8) | (((b & 0x7fu) << 4) + 0x7700u);
-        return u | (u << 16);
-    }
-    // Preserve zero, subnormal and NaN behavior for unusual scale bytes.
     uint32_t h2;
     const unsigned short dup = (unsigned short)(b | (b << 8));
     asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h2) : "h"(dup));
@@ -278,13 +272,19 @@ __device__ __forceinline__ void down_item(const __nv_bfloat16* __restrict__ act,
         for (int w = 0; w < 8; ++w) y += red[w * MT * 128 + e2];
         int i, row;
         elem(e2, i, row);
+        float v2 = 0.f;
         if (i < n) {
             const int col = tile * 16 + row;
             const __nv_bfloat16 yb = __float2bfloat16_rn(y * gsc);
             ybuf[(size_t)routes[i] * H + col] = yb;
             const float v = __bfloat162float(yb) * (1.f + __bfloat162float(norm_w[col]));
-            atomicAdd(&sq[i], v * v);
+            v2 = v * v;
         }
+        // Each set of eight lanes owns one route's half tile; reduce before the shared atomic.
+        v2 += __shfl_down_sync(0xffffffff, v2, 16);
+        v2 += __shfl_down_sync(0xffffffff, v2, 8);
+        v2 += __shfl_down_sync(0xffffffff, v2, 4);
+        if (lane < 4 && i < n) atomicAdd(&sq[i], v2);
     }
     __syncthreads();
     if (threadIdx.x < n) atomicAdd(&ssq[routes[threadIdx.x]], sq[threadIdx.x]);
