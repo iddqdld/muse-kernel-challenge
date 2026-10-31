@@ -1078,7 +1078,9 @@ def _router_lt_variants(state, m):
             w = state[w0 if layout == 0 else w2]
             flat = _lt_mod().lt_algos(xin, w, _out(x, "router", nout), layout, state["lt_ws"], 8)
             found += [(kind, (layout, *flat[i:i + 9])) for i in range(0, len(flat), 9)]
-    return [c for c in dict.fromkeys(found) if c[1][3] == 1]  # cfg[3] = SPLITK_NUM
+    candidates = [c for c in dict.fromkeys(found) if c[1][3] <= 1]  # unsplit SPLITK_NUM can be 0 or 1
+    print(f"BENCH router m={m} lt heuristics={len(found)} unsplit={len(candidates)}", flush=True)
+    return candidates
 
 
 def _run(kind, cfg, x, state, layer, n):
