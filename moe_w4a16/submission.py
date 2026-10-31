@@ -209,6 +209,7 @@ __device__ __forceinline__ void up_item(const __nv_bfloat16* __restrict__ x, con
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3, q = warp & 3;
     const size_t tb = (size_t)e * (2 * I / 16) + tile + (warp >= 4 ? I / 16 : 0);
     const __nv_bfloat16* brow[MT];
+    // Padded rows read the group's first route; the epilogue discards their accumulators.
 #pragma unroll
     for (int nt = 0; nt < MT; ++nt) {
         const int i = nt * 8 + g;
