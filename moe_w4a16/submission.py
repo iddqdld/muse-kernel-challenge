@@ -429,10 +429,11 @@ cudaError_t moe_launch(const void* x, const int* ids, const float* wts, int M, i
     moe_route_kernel<<<1, 1024, 0, st>>>(ids, n_ids, local_start, meta, list);
     // topk gives each token distinct experts: n<=M, so M<=8 uses MT=1 and M<=16 uses MT<=2.
     if (M <= 8) {
+        const int small_grid = grid + grid / 2;  // MT=1 uses <=80 registers, so three blocks fit per SM.
         launch_up<1>((const __nv_bfloat16*)x, meta, list, local_start, (const int4*)c13, (const int4*)s13,
-                     gs13, (__nv_bfloat16*)act, grid, st);
+                     gs13, (__nv_bfloat16*)act, small_grid, st);
         launch_down<1>((const __nv_bfloat16*)act, meta, list, local_start, (const int4*)c2, (const int4*)s2,
-                       gs2, (__nv_bfloat16*)ybuf, grid, st);
+                       gs2, (__nv_bfloat16*)ybuf, small_grid, st);
     } else if (M <= 16) {
         launch_up<2>((const __nv_bfloat16*)x, meta, list, local_start, (const int4*)c13, (const int4*)s13,
                      gs13, (__nv_bfloat16*)act, grid, st);
