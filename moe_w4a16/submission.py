@@ -427,7 +427,7 @@ cudaError_t moe_launch(const void* x, const int* ids, const float* wts, int M, i
     const int n_ids = M * TOPK;
     if (n_ids > 32 * MAX_GROUPS - 32 * LOCAL) return cudaErrorInvalidValue;  // groups always fit
     moe_route_kernel<<<1, 1024, 0, st>>>(ids, n_ids, local_start, meta, list);
-    // Each token visits an expert at most once, so M<=8 needs MT=1 and M<=16 needs at most MT=2.
+    // topk gives each token distinct experts: n<=M, so M<=8 uses MT=1 and M<=16 uses MT<=2.
     if (M <= 8) {
         launch_up<1>((const __nv_bfloat16*)x, meta, list, local_start, (const int4*)c13, (const int4*)s13,
                      gs13, (__nv_bfloat16*)act, grid, st);
