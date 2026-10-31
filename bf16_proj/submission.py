@@ -64,16 +64,18 @@ CUDA_KERNELS = r"""
 #include <stdint.h>
 namespace cg = cooperative_groups;
 
+// volatile: keeps every load of an unrolled step ahead of the step's MMAs. Without it, ptxas
+// issued only a few of the U loads before the first use (U = 16 compiled to 40 registers).
 __device__ __forceinline__ int4 ld_stream(const void* p) {
     int4 v;
-    asm("ld.global.nc.L1::no_allocate.v4.s32 {%0,%1,%2,%3}, [%4];"
-        : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+    asm volatile("ld.global.nc.L1::no_allocate.v4.s32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
     return v;
 }
 
 __device__ __forceinline__ int2 ld_stream2(const void* p) {
     int2 v;
-    asm("ld.global.nc.L1::no_allocate.v2.s32 {%0,%1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(p));
+    asm volatile("ld.global.nc.L1::no_allocate.v2.s32 {%0,%1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(p));
     return v;
 }
 
@@ -82,6 +84,24 @@ __device__ __forceinline__ void mma_bf16(float* c, int a0, int a1, int a2, int a
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// Two register stages over k in [k_begin, k_end), 32 * U per step (k_end - k_begin is a multiple):
+// the loads of step i + 1 are in flight while step i computes.
+template <int U, class Stage, class Load, class Compute>
+__device__ __forceinline__ void pipeline2(int k_begin, int k_end, Load& load, Compute& compute) {
+    Stage A, B;
+    load(A, k_begin);
+    for (int kb = k_begin + 32 * U;; kb += 64 * U) {
+        const bool more = kb < k_end;
+        if (more) load(B, kb);
+        compute(A);
+        if (!more) break;
+        const bool more2 = kb + 32 * U < k_end;
+        if (more2) load(A, kb + 32 * U);
+        compute(B);
+        if (!more2) break;
+    }
 }
 
 // The end of both kernels. The 8 warps of the CTA: warps 4-7 hand their partials to warps 0-3,
@@ -187,34 +207,37 @@ __global__ void __launch_bounds__(256) skinny_mma_kernel(
         xrow[nt] = x + (size_t)(xok[nt] ? tok : 0) * KX + t * 8;
     }
 
-    for (int kb = k_begin; kb < k_begin + kw; kb += 32 * U) {
+    struct Stage { int4 wa[U][RT], wb[U][RT], xv[U][MT]; };
+    auto load = [&](Stage& st, int kb) {
         const int kx = kb % KX;
-        int4 wa[U][RT], wb[U][RT], xv[U][MT];
 #pragma unroll
         for (int u = 0; u < U; ++u) {
 #pragma unroll
             for (int rt = 0; rt < RT; ++rt) {
                 const int4* p = wt[rt] + (size_t)((kb >> 5) + u) * 64;
-                wa[u][rt] = ld_stream(p);
-                wb[u][rt] = ld_stream(p + 32);
+                st.wa[u][rt] = ld_stream(p);
+                st.wb[u][rt] = ld_stream(p + 32);
             }
 #pragma unroll
             for (int nt = 0; nt < MT; ++nt)
-                xv[u][nt] = xok[nt] ? __ldg(reinterpret_cast<const int4*>(xrow[nt] + kx + u * 32))
-                                    : make_int4(0, 0, 0, 0);
+                st.xv[u][nt] = xok[nt] ? __ldg(reinterpret_cast<const int4*>(xrow[nt] + kx + u * 32))
+                                       : make_int4(0, 0, 0, 0);
         }
+    };
+    auto compute = [&](const Stage& st) {
 #pragma unroll
         for (int u = 0; u < U; ++u)
 #pragma unroll
             for (int rt = 0; rt < RT; ++rt)
 #pragma unroll
                 for (int nt = 0; nt < MT; ++nt) {
-                    mma_bf16(acc[rt][nt], wa[u][rt].x, wb[u][rt].x, wa[u][rt].y, wb[u][rt].y,
-                             xv[u][nt].x, xv[u][nt].y);
-                    mma_bf16(acc[rt][nt], wa[u][rt].z, wb[u][rt].z, wa[u][rt].w, wb[u][rt].w,
-                             xv[u][nt].z, xv[u][nt].w);
+                    mma_bf16(acc[rt][nt], st.wa[u][rt].x, st.wb[u][rt].x, st.wa[u][rt].y, st.wb[u][rt].y,
+                             st.xv[u][nt].x, st.xv[u][nt].y);
+                    mma_bf16(acc[rt][nt], st.wa[u][rt].z, st.wb[u][rt].z, st.wa[u][rt].w, st.wb[u][rt].w,
+                             st.xv[u][nt].z, st.xv[u][nt].w);
                 }
-    }
+    };
+    pipeline2<U, Stage>(k_begin, k_begin + kw, load, compute);
     reduce_store<RT, MT, OUT_F32>(acc, red, out, row0, m0, Mz, N);
 }
 
@@ -273,38 +296,42 @@ __global__ void __launch_bounds__(256) c12_mma_kernel(
         xrow[nt] = x + (size_t)(xok[nt] ? tok : 0) * K + t * 8;
     }
 
-    for (int kb = k_begin; kb < k_begin + kw; kb += 32 * U) {
-        int4 s[U][RT], xv[U][MT];
-        int2 q[U][RT];
+    // Two register stages: the loads of step i + 1 are in flight while step i decodes.
+    struct Stage { int4 s[U][RT], xv[U][MT]; int2 q[U][RT]; };
+    auto load = [&](Stage& st, int kb) {
 #pragma unroll
         for (int u = 0; u < U; ++u) {
 #pragma unroll
             for (int rt = 0; rt < RT; ++rt) {
                 const size_t o = (size_t)((kb >> 5) + u) * 32;
-                s[u][rt] = ld_stream(sp[rt] + o);
-                q[u][rt] = ld_stream2(qp[rt] + o);
+                st.s[u][rt] = ld_stream(sp[rt] + o);
+                st.q[u][rt] = ld_stream2(qp[rt] + o);
             }
 #pragma unroll
             for (int nt = 0; nt < MT; ++nt)
-                xv[u][nt] = xok[nt] ? __ldg(reinterpret_cast<const int4*>(xrow[nt] + kb + u * 32))
-                                    : make_int4(0, 0, 0, 0);
+                st.xv[u][nt] = xok[nt] ? __ldg(reinterpret_cast<const int4*>(xrow[nt] + kb + u * 32))
+                                       : make_int4(0, 0, 0, 0);
         }
+    };
+    auto compute = [&](const Stage& st) {
 #pragma unroll
         for (int u = 0; u < U; ++u)
 #pragma unroll
             for (int rt = 0; rt < RT; ++rt) {
-                const uint32_t q0 = q[u][rt].x, q1 = q[u][rt].y;
-                const int a0 = dec_pair<0>(s[u][rt].x, q0, basew), a1 = dec_pair<1>(s[u][rt].x, q0, basew);
-                const int a2 = dec_pair<2>(s[u][rt].y, q0, basew), a3 = dec_pair<3>(s[u][rt].y, q0, basew);
-                const int b0 = dec_pair<0>(s[u][rt].z, q1, basew), b1 = dec_pair<1>(s[u][rt].z, q1, basew);
-                const int b2 = dec_pair<2>(s[u][rt].w, q1, basew), b3 = dec_pair<3>(s[u][rt].w, q1, basew);
+                const int4 s = st.s[u][rt];
+                const uint32_t q0 = st.q[u][rt].x, q1 = st.q[u][rt].y;
+                const int a0 = dec_pair<0>(s.x, q0, basew), a1 = dec_pair<1>(s.x, q0, basew);
+                const int a2 = dec_pair<2>(s.y, q0, basew), a3 = dec_pair<3>(s.y, q0, basew);
+                const int b0 = dec_pair<0>(s.z, q1, basew), b1 = dec_pair<1>(s.z, q1, basew);
+                const int b2 = dec_pair<2>(s.w, q1, basew), b3 = dec_pair<3>(s.w, q1, basew);
 #pragma unroll
                 for (int nt = 0; nt < MT; ++nt) {
-                    mma_bf16(acc[rt][nt], a0, b0, a1, b1, xv[u][nt].x, xv[u][nt].y);
-                    mma_bf16(acc[rt][nt], a2, b2, a3, b3, xv[u][nt].z, xv[u][nt].w);
+                    mma_bf16(acc[rt][nt], a0, b0, a1, b1, st.xv[u][nt].x, st.xv[u][nt].y);
+                    mma_bf16(acc[rt][nt], a2, b2, a3, b3, st.xv[u][nt].z, st.xv[u][nt].w);
                 }
             }
-    }
+    };
+    pipeline2<U, Stage>(k_begin, k_begin + kw, load, compute);
 
     // Exceptions: entry (k | row << 16, w_true | w_decoded << 16). Lanes holding the row fix
     // their two tokens per 8-token tile.
@@ -359,12 +386,19 @@ static cudaError_t launch_rmu(cudaLaunchConfig_t* cfg, bool f32, const __nv_bflo
     return cudaLaunchKernelEx(cfg, skinny_mma_kernel<RT, MT, U, false>, x, w, out, M, N, KX, KW, k_cta);
 }
 
+// Instances that fit in registers with two pipeline stages (see _unroll_ok in Python):
+// U 8 only at RT 1, MT 1; U 4 at RT 1 or MT <= 2; U 2 always.
 template <int RT, int MT>
 static cudaError_t launch_rm(cudaLaunchConfig_t* cfg, int u, bool f32, const __nv_bfloat16* x,
                              const int4* w, void* out, int M, int N, int KX, int KW, int k_cta) {
-    if (u == 8) return launch_rmu<RT, MT, 8>(cfg, f32, x, w, out, M, N, KX, KW, k_cta);
+    if constexpr (RT == 1 && MT == 1) {
+        if (u == 8) return launch_rmu<RT, MT, 8>(cfg, f32, x, w, out, M, N, KX, KW, k_cta);
+    }
+    if constexpr (RT == 1 || MT <= 2) {
+        if (u == 4) return launch_rmu<RT, MT, 4>(cfg, f32, x, w, out, M, N, KX, KW, k_cta);
+    }
     if (u == 2) return launch_rmu<RT, MT, 2>(cfg, f32, x, w, out, M, N, KX, KW, k_cta);
-    return launch_rmu<RT, MT, 4>(cfg, f32, x, w, out, M, N, KX, KW, k_cta);
+    return cudaErrorInvalidValue;
 }
 
 template <int RT>
@@ -399,12 +433,14 @@ static cudaError_t c12_rmu(cudaLaunchConfig_t* cfg, const C12Args& a) {
 
 template <int RT, int MT>
 static cudaError_t c12_rm(cudaLaunchConfig_t* cfg, int u, const C12Args& a) {
-    if constexpr (RT == 1) {  // RT 2 with U 16 would hold 192 registers of W
-        if (u == 16) return c12_rmu<RT, MT, 16>(cfg, a);
+    if constexpr (RT == 1 && MT == 1) {
+        if (u == 8) return c12_rmu<RT, MT, 8>(cfg, a);
     }
-    if (u == 8) return c12_rmu<RT, MT, 8>(cfg, a);
+    if constexpr (RT == 1 || MT <= 2) {
+        if (u == 4) return c12_rmu<RT, MT, 4>(cfg, a);
+    }
     if (u == 2) return c12_rmu<RT, MT, 2>(cfg, a);
-    return c12_rmu<RT, MT, 4>(cfg, a);
+    return cudaErrorInvalidValue;
 }
 
 template <int RT>
@@ -477,7 +513,7 @@ def _cuda():
                 name="muse_bf16_proj_v4", cpp_sources=CPP_DECLS, cuda_sources=CUDA_KERNELS + CUDA_TORCH,
                 functions=["skinny_mma", "c12_mma"], extra_cuda_cflags=["-O3"], verbose=False)
             print(f"CUDA compiled in {time.time() - t0:.0f}s", flush=True)
-        except Exception as e:  # noqa: BLE001 - fall back to Triton / cuBLAS and say why
+        except Exception as e:  # noqa: BLE001 - fall back to cuBLAS and say why
             print(f"CUDA compile failed after {time.time() - t0:.0f}s: {str(e)[-3000:]}", flush=True)
             _MOD = False
     return _MOD or None
@@ -488,19 +524,13 @@ LAYER_NAMES = ("qkv_gate", "o", "pooler", "unpooler", "router")
 
 # (layer, bucket) -> ("c12", (rt, u, ksplit)) on 12-bit coded weights, ("cuda", (rt, u, ksplit))
 # on plain packed weights, or ("torch", None) for SGLang's own dispatch. Filled from BENCH runs.
-PLAN = {  # check 67996f44: CUDA GEMV on packed weights where it wins
-    **{(layer, m): ("torch", None) for layer in LAYER_NAMES for m in BUCKETS},
-    ("qkv_gate", 1): ("cuda", (1, 8, 2)),
-    ("qkv_gate", 8): ("cuda", (1, 8, 2)),
-    ("qkv_gate", 16): ("cuda", (2, 2, 4)),
-    ("o", 1): ("cuda", (1, 4, 1)),
-    ("pooler", 1): ("cuda", (1, 8, 2)),
-    ("pooler", 8): ("cuda", (1, 8, 2)),
-    ("pooler", 16): ("cuda", (2, 8, 2)),
-    ("unpooler", 1): ("cuda", (1, 4, 4)),
-    ("unpooler", 8): ("cuda", (1, 4, 4)),
-    **{("router", m): ("cuda", (1, 8, 8)) for m in (1, 8, 16, 32)},
-}
+PLAN = {(layer, m): ("torch", None) for layer in LAYER_NAMES for m in BUCKETS}
+
+
+def _unroll_ok(rt, u, m):
+    """The (RT, U) instances the CUDA launchers compile for this token count (no spills)."""
+    mt = 1 if m <= 8 else 2 if m <= 16 else 4
+    return u == 2 or (u == 4 and (rt == 1 or mt <= 2)) or (u == 8 and rt == 1 and mt == 1)
 
 
 def _bucket(m):
@@ -668,18 +698,18 @@ def _variants(state, m, layer, n, k_w):
     out = [("torch", None)]
     if PLAN.get((layer, m), ("torch",))[0] != "torch":
         out.append(PLAN[(layer, m)])
-    if not _MOD:
+    if not _MOD or (m > 32 and layer != "router"):  # token groups lost 3-7x to cuBLAS (check 45fd2ba0)
         return out
     kinds = ["cuda"] + (["c12"] if state["c12"].get(layer) is not None else [])
     for kind in kinds:
         for rt in (1, 2):
-            for u in ((2, 4, 8, 16) if kind == "c12" and rt == 1 else (2, 4, 8)):
+            for u in (2, 4, 8):
                 for ks in (1, 2, 4, 8):
                     ctas = n // (16 * rt) * ks
-                    if n % (16 * rt) or k_w % (ks * 8 * 32 * u) or not 64 <= ctas <= 2112:
+                    if (n % (16 * rt) or k_w % (ks * 8 * 32 * u) or not 64 <= ctas <= 2112
+                            or not _unroll_ok(rt, u, m)):
                         continue
-                    if (kind, (rt, u, ks)) not in out:
-                        out.append((kind, (rt, u, ks)))
+                    out.append((kind, (rt, u, ks)))
     return out
 
 
