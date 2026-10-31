@@ -59,7 +59,7 @@ class Inputs(TypedDict):
 
 
 LOCAL = 32  # experts on this GPU (ep8)
-MAX_GROUPS = 160  # route groups of up to 32 per expert; matches the CUDA constant
+MAX_GROUPS = 160  # route groups of up to 16 per expert; matches the CUDA constant
 
 CUDA_SRC = r"""
 #include <cuda_runtime.h>
@@ -133,12 +133,13 @@ __device__ __forceinline__ void mma_hi(float (&acc)[4], const uint32_t (&A)[2][4
 }
 
 // meta (int32): [0] number of groups; then per group (at most MAX_GROUPS): local expert, first
-// position in the route list, route count (at most 32). A group is one pass of an expert.
+// position in the route list, route count (at most 16). A group is one pass of an expert.
 constexpr int MAX_GROUPS = 160;
+constexpr int GROUP_ROUTES = 16;
 constexpr int META_E = 1, META_BEG = 1 + MAX_GROUPS, META_N = 1 + 2 * MAX_GROUPS;
 
 // 1 block, 1024 threads: the local routes (token * 8 + slot) sorted by expert into list, the
-// groups of up to 32 routes per expert into meta.
+// groups of up to 16 routes per expert into meta.
 __global__ void __launch_bounds__(1024) moe_route_kernel(const int* __restrict__ ids, int n_ids, int local_start,
                                                          int* __restrict__ meta, int* __restrict__ list) {
     __shared__ int cnt[LOCAL], cur[LOCAL];
@@ -153,10 +154,10 @@ __global__ void __launch_bounds__(1024) moe_route_kernel(const int* __restrict__
         int off = 0, ng = 0;
         for (int e = 0; e < LOCAL; ++e) {
             cur[e] = off;
-            for (int g0 = 0; g0 < cnt[e] && ng < MAX_GROUPS; g0 += 32, ++ng) {
+            for (int g0 = 0; g0 < cnt[e] && ng < MAX_GROUPS; g0 += GROUP_ROUTES, ++ng) {
                 meta[META_E + ng] = e;
                 meta[META_BEG + ng] = off + g0;
-                meta[META_N + ng] = min(32, cnt[e] - g0);
+                meta[META_N + ng] = min(GROUP_ROUTES, cnt[e] - g0);
             }
             off += cnt[e];
         }
@@ -395,7 +396,7 @@ cudaError_t moe_launch(const void* x, const int* ids, const float* wts, int M, i
                        const float* gs2, const void* norm_w, void* act, void* ybuf, int* meta,
                        int* list, int grid, void* out, cudaStream_t st) {
     const int n_ids = M * TOPK;
-    if (n_ids > 32 * MAX_GROUPS - 32 * LOCAL) return cudaErrorInvalidValue;  // groups always fit
+    if (n_ids > GROUP_ROUTES * (MAX_GROUPS - LOCAL + 1)) return cudaErrorInvalidValue;  // groups always fit
     moe_route_kernel<<<1, 1024, 0, st>>>(ids, n_ids, local_start, meta, list);
     moe_up_kernel<<<grid, 256, 0, st>>>((const __nv_bfloat16*)x, meta, list, local_start, (const int4*)c13,
                                         (const int4*)s13, gs13, (__nv_bfloat16*)act);
