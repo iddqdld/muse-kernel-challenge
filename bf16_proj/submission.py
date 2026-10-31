@@ -105,8 +105,9 @@ __device__ __forceinline__ void pipeline2(int k_begin, int k_end, Load& load, Co
 
 // The end of ksplit_kernel. The 8 warps of the CTA: warps 4-7 hand their partials to warps 0-3,
 // then all threads add the 4 remaining copies into red[0]. Two rounds keep shared memory at 4
-// copies. With ksplit > 1, cluster rank 0 adds the other CTAs' red[0] through DSMEM. Then the
-// writer stores tokens m0 .. m0 + M - 1 of rows row0 .. row0 + 16 * RT - 1.
+// copies. With ksplit > 1 the cluster's CTAs reduce-scatter: rank r sums its 1/ksplit slice of
+// the elements over all ranks' red[0] through DSMEM (independent loads, all ranks at once) and
+// stores that slice. Tokens m0 .. m0 + M - 1 of rows row0 .. row0 + 16 * RT - 1.
 template <int RT, int MT, bool OUT_F32>
 __device__ __forceinline__ void reduce_store(float (&acc)[RT][MT][4], float (*red)[RT * MT * 128],
                                              void* out, int row0, int m0, int M, int N) {
@@ -139,34 +140,37 @@ __device__ __forceinline__ void reduce_store(float (&acc)[RT][MT][4], float (*re
 #pragma unroll 1  // rolled loops keep the kernel small: its code comes from HBM on every call
     for (int e = threadIdx.x; e < E; e += 256) red[0][e] = red[0][e] + red[1][e] + red[2][e] + red[3][e];
 
-    const int ksplit = gridDim.y;
-    bool writer = true;
-    if (ksplit > 1) {
-        cg::cluster_group cluster = cg::this_cluster();
-        cluster.sync();
-        writer = cluster.block_rank() == 0;
-        if (writer)
-            for (int r = 1; r < ksplit; ++r) {
-                const float* other = cluster.map_shared_rank(&red[0][0], r);
-#pragma unroll 1
-                for (int e = threadIdx.x; e < E; e += 256) red[0][e] += other[e];
-            }
-        cluster.sync();  // the others' shared memory must outlive rank 0's reads
-    } else {
-        __syncthreads();
-    }
-    if (!writer) return;
-#pragma unroll 1
-    for (int e = threadIdx.x; e < E; e += 256) {
+    auto store = [&](int e, float v) {
         const int ln = e & 31, j = (e >> 5) & 3, nt = (e >> 7) % MT, rt = (e >> 7) / MT;
         const int row = row0 + rt * 16 + (ln >> 2) + (j >= 2 ? 8 : 0);
         const int tok = nt * 8 + 2 * (ln & 3) + (j & 1);
         if (tok < M) {
             const size_t o = (size_t)(m0 + tok) * N + row;
-            if (OUT_F32) reinterpret_cast<float*>(out)[o] = red[0][e];
-            else reinterpret_cast<__nv_bfloat16*>(out)[o] = __float2bfloat16(red[0][e]);
+            if (OUT_F32) reinterpret_cast<float*>(out)[o] = v;
+            else reinterpret_cast<__nv_bfloat16*>(out)[o] = __float2bfloat16(v);
         }
+    };
+    const int ksplit = gridDim.y;
+    if (ksplit > 1) {
+        cg::cluster_group cluster = cg::this_cluster();
+        cluster.sync();
+        const int chunk = E / ksplit, e0 = (int)cluster.block_rank() * chunk;  // E % ksplit == 0
+        float v[2] = {0.f, 0.f};  // chunk <= 512 = 2 elements per thread
+#pragma unroll
+        for (int i = 0; i < 2; ++i)
+            if (i * 256 + (int)threadIdx.x < chunk)
+#pragma unroll 4
+                for (int q = 0; q < ksplit; ++q)
+                    v[i] += cluster.map_shared_rank(&red[0][0], q)[e0 + i * 256 + threadIdx.x];
+        cluster.sync();  // the others' shared memory must outlive this CTA's reads
+#pragma unroll
+        for (int i = 0; i < 2; ++i)
+            if (i * 256 + (int)threadIdx.x < chunk) store(e0 + i * 256 + threadIdx.x, v[i]);
+        return;
     }
+    __syncthreads();
+#pragma unroll 1
+    for (int e = threadIdx.x; e < E; e += 256) store(e, red[0][e]);
 }
 
 // One bf16x2 fragment register from the 12-bit code (see pack_c12 in Python). s holds the

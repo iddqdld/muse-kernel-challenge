@@ -1,0 +1,39 @@
+CUDA compiled in 48s
+ENV gpu NVIDIA H200 sm90 sms=132 l2=60MB | torch 2.14.1+cu130
+C12 qkv_gate: base exponent 107, 1363 exceptions
+C12 o: base exponent 109, 758 exceptions
+C12 pooler: base exponent 107, 2213 exceptions
+C12 unpooler: base exponent 108, 3236 exceptions
+BENCH net us (judge's 3.8us fixed cost removed); [rt,u,ksplit] of c=cuda z=c12 w=c12w; t=SGLang dispatch, T/N=cuBLAS on W^T copy / W view
+BENCH m=1   qkv_gate sgl= 13.13 torch= 12.94 best= 11.34 x1.16 | 11.34c[1, 4, 1] 11.37c[1, 4, 1] 11.72c[1, 2, 2]
+BENCH m=1   o        sgl=  6.66 torch=  6.63 best=  5.93 x1.12 | 5.93c[2, 2, 1] 6.09c[2, 2, 1] 6.22c[1, 2, 1]
+BENCH m=1   pooler   sgl= 21.13 torch= 21.32 best= 15.69 x1.35 | 15.69z[1, 4, 1] 15.69z[1, 4, 1] 15.91w[1, 4, 1]
+BENCH m=1   unpooler sgl=  7.37 torch=  7.21 best=  4.71 x1.56 | 4.71c[1, 8, 1] 4.78c[1, 8, 1] 4.87c[1, 4, 1]
+BENCH m=1   router   sgl= 10.89 torch= 15.69 best=  5.96 x1.83 | 5.96c[1, 8, 4] 6.02c[1, 8, 4] 6.18c[1, 4, 4]
+BENCH m=8   qkv_gate sgl= 13.70 torch= 13.77 best= 11.94 x1.15 | 11.94c[1, 2, 2] 12.23c[1, 4, 1] 12.33c[1, 4, 1]
+BENCH m=8   o        sgl=  6.50 torch=  6.47 best=  6.06 x1.07 | 6.06c[2, 2, 1] 6.18c[1, 2, 1] 6.25c[2, 2, 1]
+BENCH m=8   pooler   sgl= 21.45 torch= 21.32 best= 16.01 x1.34 | 16.01z[1, 4, 1] 16.04z[1, 4, 1] 16.17w[1, 4, 1]
+BENCH m=8   unpooler sgl=  7.24 torch=  7.24 best=  5.06 x1.43 | 5.06c[1, 8, 1] 5.13c[1, 4, 1] 5.16c[1, 8, 1]
+BENCH m=8   router   sgl= 26.98 torch= 16.39 best=  6.15 x4.39 | 6.15c[1, 8, 4] 6.31c[1, 4, 4] 6.47c[1, 4, 8]
+BENCH m=16  qkv_gate sgl= 14.44 torch= 14.54 best= 13.58 x1.06 | 13.58c[2, 2, 2] 13.64c[2, 4, 1] 13.70c[2, 4, 1]
+BENCH m=16  o        sgl=  6.50 torch=  6.57 best=  6.50 x1.00 | 6.50N 6.57t 6.66T
+BENCH m=16  pooler   sgl= 21.35 torch= 21.22 best= 18.54 x1.15 | 18.54c[2, 4, 1] 18.63c[2, 2, 2] 18.66c[2, 4, 1]
+BENCH m=16  unpooler sgl= 17.86 torch= 17.80 best= 17.51 x1.02 | 17.51T 17.58T 17.80t
+BENCH m=16  router   sgl= 16.49 torch= 16.62 best=  6.79 x2.43 | 6.79c[1, 4, 4] 6.89c[1, 4, 4] 7.37c[1, 2, 8]
+BENCH m=32  qkv_gate sgl= 14.41 torch= 14.34 best= 14.25 x1.01 | 14.25T 14.31N 14.34t
+BENCH m=32  o        sgl=  6.60 torch=  6.57 best=  6.57 x1.00 | 6.57t 6.66T 6.70N
+BENCH m=32  pooler   sgl= 22.18 torch= 21.54 best= 20.46 x1.08 | 20.46T 20.49T 21.29c[2, 2, 1]
+BENCH m=32  unpooler sgl= 17.93 torch= 18.06 best= 17.67 x1.01 | 17.67T 17.80T 17.96N
+BENCH m=32  router   sgl= 16.58 torch= 16.71 best=  9.29 x1.79 | 9.29c[1, 4, 4] 9.38c[1, 4, 4] 9.90c[1, 2, 8]
+BENCH m=128 qkv_gate sgl= 17.42 torch= 17.48 best= 17.13 x1.02 | 17.13T 17.48t 17.58N
+BENCH m=128 o        sgl=  7.18 torch=  7.18 best=  7.02 x1.02 | 7.02N 7.18t 7.53T
+BENCH m=128 pooler   sgl= 25.83 torch= 25.77 best= 22.98 x1.12 | 22.98T 23.02T 25.70N
+BENCH m=128 unpooler sgl= 18.95 torch= 18.73 best= 18.44 x1.03 | 18.44T 18.44T 18.73t
+BENCH m=128 router   sgl= 17.54 torch= 17.90 best= 11.50 x1.53 | 11.50T 11.75T 13.16N
+BENCH m=256 qkv_gate sgl= 19.53 torch= 19.43 best= 19.40 x1.01 | 19.40N 19.43t 20.26T
+BENCH m=256 o        sgl=  9.00 torch=  9.38 best=  8.84 x1.02 | 8.84T 9.38t 9.45N
+BENCH m=256 pooler   sgl= 29.67 torch= 28.23 best= 24.81 x1.20 | 24.81T 28.20N 28.23t
+BENCH m=256 unpooler sgl= 24.81 torch= 23.88 best= 23.85 x1.04 | 23.85N 23.88t 23.88T
+BENCH m=256 router   sgl= 18.66 torch= 18.73 best= 13.93 x1.34 | 13.93T 14.02T 15.27N
+BENCH loads m=1:x1.36 m=8:x1.68 m=16:x1.22 m=32:x1.14 m=128:x1.13 m=256:x1.12 | est speedup x1.259 | sweep 13s
+PLAN = {('qkv_gate', 1): ('cuda', (1, 4, 1)), ('qkv_gate', 8): ('cuda', (1, 2, 2)), ('qkv_gate', 16): ('cuda', (2, 2, 2)), ('qkv_gate', 32): ('mm_t', None), ('qkv_gate', 128): ('mm_t', None), ('qkv_gate', 256): ('mm_n', None), ('o', 1): ('cuda', (2, 2, 1)), ('o', 8): ('cuda', (2, 2, 1)), ('o', 16): ('mm_n', None), ('o', 32): ('torch', None), ('o', 128): ('mm_n', None), ('o', 256): ('mm_t', None), ('pooler', 1): ('c12', (1, 4, 1)), ('pooler', 8): ('c12', (1, 4, 1)), ('pooler', 16): ('cuda', (2, 4, 1)), ('pooler', 32): ('mm_t', None), ('pooler', 128): ('mm_t', None), ('pooler', 256): ('mm_t', None), ('unpooler', 1): ('cuda', (1, 8, 1)), ('unpooler', 8): ('cuda', (1, 8, 1)), ('unpooler', 16): ('mm_t', None), ('unpooler', 32): ('mm_t', None), ('unpooler', 128): ('mm_t', None), ('unpooler', 256): ('mm_n', None), ('router', 1): ('cuda', (1, 8, 4)), ('router', 8): ('cuda', (1, 8, 4)), ('router', 16): ('cuda', (1, 4, 4)), ('router', 32): ('cuda', (1, 4, 4)), ('router', 128): ('mm_t', None), ('router', 256): ('mm_t', None)}
