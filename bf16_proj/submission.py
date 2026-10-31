@@ -252,14 +252,16 @@ __device__ __forceinline__ uint32_t dec_pair(uint32_t s, uint32_t q, uint32_t ba
     return (b & 0x00800080u) * 0xFFu + b + e + basew;  // sign bit 7 -> 15: s * 0x7F80 + s * 0x80
 }
 
-// skinny_mma_kernel on 12-bit coded BF16 weights: per 16-row tile and 32-wide k block, a lane
-// reads 16 sign | mantissa bytes (rows g and g + 8, k 8t .. 8t + 7) and 8 bytes of exponent
-// codes, so a warp reads 768 bytes instead of 1024. Values below the code's exponent window
-// decode to a known wrong value; each warp then adds (w_true - w_decoded) * x for the
-// exceptions of its own k slice (list sorted per tile), which makes the product exact.
-template <int RT, int MT, int U, bool DEC = true>  // DEC false: no decode, wrong values (timing probe)
+// skinny_mma_kernel on 12-bit coded BF16 weights. Per 16-row tile and 32-wide k block the code is
+// one 768-byte piece: 512 sign | mantissa bytes, then 256 bytes of exponent codes. A lane reads
+// 16 bytes of the first part (rows g and g + 8, k 8t .. 8t + 7) and 8 bytes of the second, so a
+// warp reads 768 bytes instead of 1024, and a tile's whole K range is one linear stream. Values
+// below the code's exponent window decode to a known wrong value; each warp then adds
+// (w_true - w_decoded) * x for the exceptions of its own k slice (list sorted per tile), which
+// makes the product exact.
+template <int RT, int MT, int U>
 __global__ void __launch_bounds__(256) c12_mma_kernel(
-        const __nv_bfloat16* __restrict__ x, const int4* __restrict__ sm, const int2* __restrict__ ex,
+        const __nv_bfloat16* __restrict__ x, const int4* __restrict__ w12,
         const int* __restrict__ exc_off, const int2* __restrict__ exc, __nv_bfloat16* __restrict__ out,
         int M, int N, int K, int k_cta, uint32_t basew) {
     __shared__ float red[4][RT * MT * 128];
@@ -278,14 +280,14 @@ __global__ void __launch_bounds__(256) c12_mma_kernel(
 #pragma unroll
             for (int j = 0; j < 4; ++j) acc[rt][nt][j] = 0.f;
 
-    const size_t nb = K >> 5;
+    const size_t nb = K >> 5;  // 48 int4 (768 bytes) per k block
     const int4* sp[RT];
     const int2* qp[RT];
 #pragma unroll
     for (int rt = 0; rt < RT; ++rt) {
-        const size_t o = (size_t)(blockIdx.x * RT + rt) * nb * 32 + lane;
-        sp[rt] = sm + o;
-        qp[rt] = ex + o;
+        const int4* tile = w12 + (size_t)(blockIdx.x * RT + rt) * nb * 48;
+        sp[rt] = tile + lane;
+        qp[rt] = reinterpret_cast<const int2*>(tile + 32) + lane;
     }
     const __nv_bfloat16* xrow[MT];
     bool xok[MT];
@@ -303,9 +305,9 @@ __global__ void __launch_bounds__(256) c12_mma_kernel(
         for (int u = 0; u < U; ++u) {
 #pragma unroll
             for (int rt = 0; rt < RT; ++rt) {
-                const size_t o = (size_t)((kb >> 5) + u) * 32;
-                st.s[u][rt] = ld_stream(sp[rt] + o);
-                st.q[u][rt] = ld_stream2(qp[rt] + o);
+                const size_t kbi = (kb >> 5) + u;
+                st.s[u][rt] = ld_stream(sp[rt] + kbi * 48);
+                st.q[u][rt] = ld_stream2(qp[rt] + kbi * 96);
             }
 #pragma unroll
             for (int nt = 0; nt < MT; ++nt)
@@ -320,16 +322,10 @@ __global__ void __launch_bounds__(256) c12_mma_kernel(
             for (int rt = 0; rt < RT; ++rt) {
                 const int4 s = st.s[u][rt];
                 const uint32_t q0 = st.q[u][rt].x, q1 = st.q[u][rt].y;
-                int a0, a1, a2, a3, b0, b1, b2, b3;
-                if constexpr (DEC) {
-                    a0 = dec_pair<0>(s.x, q0, basew), a1 = dec_pair<1>(s.x, q0, basew);
-                    a2 = dec_pair<2>(s.y, q0, basew), a3 = dec_pair<3>(s.y, q0, basew);
-                    b0 = dec_pair<0>(s.z, q1, basew), b1 = dec_pair<1>(s.z, q1, basew);
-                    b2 = dec_pair<2>(s.w, q1, basew), b3 = dec_pair<3>(s.w, q1, basew);
-                } else {
-                    a0 = s.x ^ q0, a1 = s.x ^ q1, a2 = s.y ^ q0, a3 = s.y ^ q1;
-                    b0 = s.z ^ q0, b1 = s.z ^ q1, b2 = s.w ^ q0, b3 = s.w ^ q1;
-                }
+                const int a0 = dec_pair<0>(s.x, q0, basew), a1 = dec_pair<1>(s.x, q0, basew);
+                const int a2 = dec_pair<2>(s.y, q0, basew), a3 = dec_pair<3>(s.y, q0, basew);
+                const int b0 = dec_pair<0>(s.z, q1, basew), b1 = dec_pair<1>(s.z, q1, basew);
+                const int b2 = dec_pair<2>(s.w, q1, basew), b3 = dec_pair<3>(s.w, q1, basew);
 #pragma unroll
                 for (int nt = 0; nt < MT; ++nt) {
                     mma_bf16(acc[rt][nt], a0, b0, a1, b1, st.xv[u][nt].x, st.xv[u][nt].y);
@@ -427,13 +423,13 @@ cudaError_t skinny_mma_launch(const void* x, const void* w, void* out, bool f32,
 }
 
 struct C12Args {
-    const __nv_bfloat16* x; const int4* sm; const int2* ex; const int* off; const int2* exc;
+    const __nv_bfloat16* x; const int4* w12; const int* off; const int2* exc;
     __nv_bfloat16* out; int M, N, K, k_cta; uint32_t basew;
 };
 
 template <int RT, int MT, int U>
 static cudaError_t c12_rmu(cudaLaunchConfig_t* cfg, const C12Args& a) {
-    return cudaLaunchKernelEx(cfg, c12_mma_kernel<RT, MT, U>, a.x, a.sm, a.ex, a.off, a.exc, a.out,
+    return cudaLaunchKernelEx(cfg, c12_mma_kernel<RT, MT, U>, a.x, a.w12, a.off, a.exc, a.out,
                               a.M, a.N, a.K, a.k_cta, a.basew);
 }
 
@@ -456,17 +452,13 @@ static cudaError_t c12_r(cudaLaunchConfig_t* cfg, int mt, int u, const C12Args& 
     return c12_rm<RT, 4>(cfg, u, a);
 }
 
-cudaError_t c12_mma_launch(const void* x, const void* sm, const void* ex, const void* off, const void* exc,
-                           void* out, int M, int N, int K, int rt, int u, int ksplit, uint32_t basew,
-                           cudaStream_t stream) {
+cudaError_t c12_mma_launch(const void* x, const void* w12, const void* off, const void* exc, void* out,
+                           int M, int N, int K, int rt, int u, int ksplit, uint32_t basew, cudaStream_t stream) {
     cudaLaunchAttribute attr[1];
     cudaLaunchConfig_t cfg = launch_cfg(N, M, rt, ksplit, stream, attr);
-    const C12Args a{static_cast<const __nv_bfloat16*>(x), static_cast<const int4*>(sm),
-                    static_cast<const int2*>(ex), static_cast<const int*>(off), static_cast<const int2*>(exc),
+    const C12Args a{static_cast<const __nv_bfloat16*>(x), static_cast<const int4*>(w12),
+                    static_cast<const int*>(off), static_cast<const int2*>(exc),
                     static_cast<__nv_bfloat16*>(out), M, N, K, K / ksplit, basew};
-    if (u == 0 && rt == 1 && mt_of(M) == 1)  // timing probe: c12 with the decode left out
-        return cudaLaunchKernelEx(&cfg, c12_mma_kernel<1, 1, 4, false>, a.x, a.sm, a.ex, a.off, a.exc, a.out,
-                                  a.M, a.N, a.K, K / ksplit, basew);
     if (rt == 2) return c12_r<2>(&cfg, mt_of(M), u, a);
     return c12_r<1>(&cfg, mt_of(M), u, a);
 }
@@ -478,9 +470,8 @@ CUDA_TORCH = r"""
 
 cudaError_t skinny_mma_launch(const void* x, const void* w, void* out, bool f32, int M, int N, int KX,
                               int KW, int rt, int u, int ksplit, cudaStream_t stream);
-cudaError_t c12_mma_launch(const void* x, const void* sm, const void* ex, const void* off, const void* exc,
-                           void* out, int M, int N, int K, int rt, int u, int ksplit, uint32_t basew,
-                           cudaStream_t stream);
+cudaError_t c12_mma_launch(const void* x, const void* w12, const void* off, const void* exc, void* out,
+                           int M, int N, int K, int rt, int u, int ksplit, uint32_t basew, cudaStream_t stream);
 
 void skinny_mma(torch::Tensor x, torch::Tensor w_packed, torch::Tensor out, int64_t kx, int64_t kw,
                 int64_t rt, int64_t u, int64_t ksplit) {
@@ -491,11 +482,11 @@ void skinny_mma(torch::Tensor x, torch::Tensor w_packed, torch::Tensor out, int6
     TORCH_CHECK(err == cudaSuccess, "skinny_mma: ", cudaGetErrorString(err));
 }
 
-void c12_mma(torch::Tensor x, torch::Tensor sm, torch::Tensor ex, torch::Tensor off, torch::Tensor exc,
-             torch::Tensor out, int64_t rt, int64_t u, int64_t ksplit, int64_t basew) {
+void c12_mma(torch::Tensor x, torch::Tensor w12, torch::Tensor off, torch::Tensor exc, torch::Tensor out,
+             int64_t rt, int64_t u, int64_t ksplit, int64_t basew) {
     TORCH_CHECK(x.is_contiguous() && out.is_contiguous());
     const cudaError_t err = c12_mma_launch(
-        x.data_ptr(), sm.data_ptr(), ex.data_ptr(), off.data_ptr(), exc.data_ptr(), out.data_ptr(),
+        x.data_ptr(), w12.data_ptr(), off.data_ptr(), exc.data_ptr(), out.data_ptr(),
         x.size(0), out.size(1), x.size(1), rt, u, ksplit, (uint32_t)basew, at::cuda::getCurrentCUDAStream());
     TORCH_CHECK(err == cudaSuccess, "c12_mma: ", cudaGetErrorString(err));
 }
@@ -504,8 +495,8 @@ void c12_mma(torch::Tensor x, torch::Tensor sm, torch::Tensor ex, torch::Tensor 
 CPP_DECLS = """
 void skinny_mma(torch::Tensor x, torch::Tensor w_packed, torch::Tensor out, int64_t kx, int64_t kw,
                 int64_t rt, int64_t u, int64_t ksplit);
-void c12_mma(torch::Tensor x, torch::Tensor sm, torch::Tensor ex, torch::Tensor off, torch::Tensor exc,
-             torch::Tensor out, int64_t rt, int64_t u, int64_t ksplit, int64_t basew);
+void c12_mma(torch::Tensor x, torch::Tensor w12, torch::Tensor off, torch::Tensor exc, torch::Tensor out,
+             int64_t rt, int64_t u, int64_t ksplit, int64_t basew);
 """
 
 _MOD = None
@@ -533,7 +524,31 @@ LAYER_NAMES = ("qkv_gate", "o", "pooler", "unpooler", "router")
 
 # (layer, bucket) -> ("c12", (rt, u, ksplit)) on 12-bit coded weights, ("cuda", (rt, u, ksplit))
 # on plain packed weights, or ("torch", None) for SGLang's own dispatch. Filled from BENCH runs.
-PLAN = {(layer, m): ("torch", None) for layer in LAYER_NAMES for m in BUCKETS}
+PLAN = {  # submit a36192b7: our kernels where they beat SGLang by more than 2% in check 8819882d
+    **{(layer, m): ("torch", None) for layer in LAYER_NAMES for m in BUCKETS},
+    ("qkv_gate", 1): ("cuda", (1, 4, 1)),
+    ("o", 1): ("cuda", (2, 2, 1)),
+    ("pooler", 1): ("c12", (1, 4, 1)),
+    ("unpooler", 1): ("cuda", (1, 8, 1)),
+    ("router", 1): ("cuda", (1, 8, 4)),
+    ("qkv_gate", 8): ("cuda", (1, 4, 1)),
+    ("o", 8): ("cuda", (2, 2, 1)),
+    ("pooler", 8): ("c12", (1, 4, 1)),
+    ("unpooler", 8): ("cuda", (1, 8, 1)),
+    ("router", 8): ("cuda", (1, 4, 8)),
+    ("qkv_gate", 16): ("cuda", (2, 4, 1)),
+    ("pooler", 16): ("cuda", (2, 4, 1)),
+    ("unpooler", 16): ("mm_t", None),
+    ("router", 16): ("cuda", (1, 4, 4)),
+    ("pooler", 32): ("mm_t", None),
+    ("unpooler", 32): ("mm_t", None),
+    ("router", 32): ("cuda", (1, 4, 4)),
+    ("pooler", 128): ("mm_t", None),
+    ("unpooler", 128): ("mm_t", None),
+    ("router", 128): ("mm_t", None),
+    ("pooler", 256): ("mm_t", None),
+    ("router", 256): ("mm_t", None),
+}
 
 
 def _unroll_ok(rt, u, m):
@@ -573,9 +588,9 @@ def pack_c12(w):
     sign and 7 mantissa bits as one byte and stores e - base as a 4-bit code. A value below the
     window (tiny values, zeros; about 1e-4 of Gaussian weights) gets code 0, so it decodes to
     sign | base | mantissa, and goes to a per-tile exception list with its true and decoded bits.
-    Planes in fragment order, per 16-row tile and 32-wide k block, lane 4g + t:
-      sm: 16 bytes, row g then row g + 8, k 8t .. 8t + 7;
-      ex: 8 bytes, one 32-bit word per row; pair j (k 2j, 2j + 1) at nibbles j and j + 4.
+    Per 16-row tile and 32-wide k block, one 768-byte piece in fragment order, lane 4g + t:
+      bytes 0-511: 16 per lane, sign | mantissa of row g then row g + 8, k 8t .. 8t + 7;
+      bytes 512-767: 8 per lane, one 32-bit word per row; pair j (k 2j, 2j + 1) at nibbles j, j + 4.
     """
     n, k = w.shape
     bits = w.contiguous().view(torch.int16).to(torch.int32) & 0xFFFF
@@ -599,9 +614,10 @@ def pack_c12(w):
     hi = true_bits | (dec_bits << 16)
     off = torch.zeros(n // 16 + 1, dtype=torch.int32, device=w.device)
     off[1:] = torch.bincount(rows // 16, minlength=n // 16).cumsum(0)
+    sm_part = frag(sm).to(torch.uint8).reshape(n // 16, k // 32, 512)
+    ex_part = (c[..., 0::2] | (c[..., 1::2] << 4)).to(torch.uint8).reshape(n // 16, k // 32, 256)
     return {
-        "sm": frag(sm).to(torch.uint8).contiguous(),
-        "ex": (c[..., 0::2] | (c[..., 1::2] << 4)).to(torch.uint8).contiguous(),
+        "w12": torch.cat([sm_part, ex_part], 2).contiguous(),
         "exc": torch.stack([cols | ((rows % 16) << 16), torch.where(hi >= 1 << 31, hi - (1 << 32), hi)],
                            1).to(torch.int32).contiguous(),
         "off": off,
@@ -613,7 +629,7 @@ def _c12_proj(x, state, layer, n, cfg):
     rt, u, ksplit = cfg
     c = state["c12"][layer]
     out = _out(x, layer, n)
-    _MOD.c12_mma(x, c["sm"], c["ex"], c["off"], c["exc"], out, rt, u, ksplit, c["basew"])
+    _MOD.c12_mma(x, c["w12"], c["off"], c["exc"], out, rt, u, ksplit, c["basew"])
     return out
 
 
@@ -771,11 +787,6 @@ def _sweep(state, budget_s=150.0):
     flush = torch.empty(max(4 * l2, 256 << 20) // 4, device=dev, dtype=torch.float32).fill_(1.0)
     gen = torch.Generator(device=dev).manual_seed(1)
     rows, load_t, probes = [], {}, {}
-    if _MOD and state["c12"].get("pooler") is not None:  # decode cost: same kernel, decode left out
-        x1 = torch.randn((1, 8192), device=dev).to(torch.bfloat16)
-        t = {u: _graph_us(lambda: _c12_proj(x1, state, "pooler", 4096, (1, u, 1)), flush)[0] - FIXED_US
-             for u in (4, 0)}
-        print(f"C12 pooler m=1 (1,4,1): decode {t[4]:.2f} us, no decode {t[0]:.2f} us", flush=True)
     for m in BUCKETS:
         for layer in LAYER_NAMES:
             w, k_x = _weight(state, layer)
