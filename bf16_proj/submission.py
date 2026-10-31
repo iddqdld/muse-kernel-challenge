@@ -185,9 +185,8 @@ struct Plain {  // pack_weight: per k block 64 int4s, rows 0-7 then rows 8-15, l
     static constexpr int NK = 1, KB = 64;
     static constexpr bool EXC = false;
     struct Raw { int4 a, b; };
-    __device__ static Raw load(const int4* tile, size_t unit, int lane) {
-        const int4* p = tile + unit * KB + lane;
-        return {ld_stream(p), ld_stream(p + 32)};
+    __device__ static Raw load(const int4* unit, int lane) {
+        return {ld_stream(unit + lane), ld_stream(unit + 32 + lane)};
     }
     __device__ static void frag(const Raw& r, int, uint32_t, int (&a)[4], int (&b)[4]) {
         a[0] = r.a.x; a[1] = r.a.y; a[2] = r.a.z; a[3] = r.a.w;
@@ -209,9 +208,8 @@ struct C12 {  // pack_c12 "w12": per k block 768 bytes, 512 sign | mantissa (16 
     static constexpr int NK = 1, KB = 48;
     static constexpr bool EXC = true;
     struct Raw { int4 s; int2 q; };
-    __device__ static Raw load(const int4* tile, size_t unit, int lane) {
-        const int4* p = tile + unit * KB;
-        return {ld_stream(p + lane), ld_stream2(reinterpret_cast<const int2*>(p + 32) + lane)};
+    __device__ static Raw load(const int4* unit, int lane) {
+        return {ld_stream(unit + lane), ld_stream2(reinterpret_cast<const int2*>(unit + 32) + lane)};
     }
     __device__ static void frag(const Raw& r, int, uint32_t basew, int (&a)[4], int (&b)[4]) {
         c12_frag(r.s, r.q.x, r.q.y, basew, a, b);
@@ -223,9 +221,8 @@ struct C12W {  // pack_c12 "w12w": per 2 k blocks 1536 bytes, sign | mantissa of
     static constexpr int NK = 2, KB = 96;
     static constexpr bool EXC = true;
     struct Raw { int4 s0, s1, q; };
-    __device__ static Raw load(const int4* tile, size_t unit, int lane) {
-        const int4* p = tile + unit * KB + lane;
-        return {ld_stream(p), ld_stream(p + 32), ld_stream(p + 64)};
+    __device__ static Raw load(const int4* unit, int lane) {
+        return {ld_stream(unit + lane), ld_stream(unit + 32 + lane), ld_stream(unit + 64 + lane)};
     }
     __device__ static void frag(const Raw& r, int j, uint32_t basew, int (&a)[4], int (&b)[4]) {
         if (j) c12_frag(r.s1, r.q.z, r.q.w, basew, a, b);
@@ -233,17 +230,17 @@ struct C12W {  // pack_c12 "w12w": per 2 k blocks 1536 bytes, sign | mantissa of
     }
 };
 
-template <class F>
-__device__ __forceinline__ const int4* tile_ptr(const int4* w, int tile, int KW) {
-    return w + (size_t)tile * (KW >> 5) / F::NK * F::KB;
-}
-
-// acc[rt] += W[tile[rt]] @ x^T over k in [k_begin, k_end), for tokens 0 .. Mz - 1 of x (row
-// stride KX; W column k meets x column k % KX, which lets the router read [hi | lo]).
+// Weights are stored in stream order (pack_stream in Python), specific to one launch geometry:
+// a warp's step is RT * U / NK units, and at step s all G warps of the grid read one contiguous
+// region: warp gw's step s is at (s * G + gw) * step. So the whole grid sweeps HBM front to back
+// instead of 1000+ warps each walking their own far-apart stream.
+// acc[rt] += W[rows of tile rt] @ x^T over k in [k_begin, k_end), for tokens 0 .. Mz - 1 of x
+// (row stride KX; W column k meets x column k % KX, which lets the router read [hi | lo]).
 template <class F, int RT, int MT, int U>
-__device__ __forceinline__ void mainloop(float (&acc)[RT][MT][4], const int4* const (&tile)[RT],
+__device__ __forceinline__ void mainloop(float (&acc)[RT][MT][4], const int4* wq, size_t sstride,
                                          const __nv_bfloat16* x, int KX, int Mz, int k_begin, int k_end,
                                          uint32_t basew) {
+    constexpr int VU = U / F::NK;
     const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const __nv_bfloat16* xrow[MT];
     bool xok[MT];
@@ -254,13 +251,14 @@ __device__ __forceinline__ void mainloop(float (&acc)[RT][MT][4], const int4* co
         xrow[nt] = x + (size_t)(xok[nt] ? tok : 0) * KX + t * 8;
     }
     static_assert(U % F::NK == 0, "a step holds whole format units");
-    struct Stage { typename F::Raw w[U / F::NK][RT]; int4 xv[U][MT]; };
+    struct Stage { typename F::Raw w[VU][RT]; int4 xv[U][MT]; };
     auto load = [&](Stage& st, int kb) {
         const int kx = kb % KX;
+        const int4* p = wq + (size_t)((kb - k_begin) / (32 * U)) * sstride;
 #pragma unroll
-        for (int v = 0; v < U / F::NK; ++v)
+        for (int rt = 0; rt < RT; ++rt)
 #pragma unroll
-            for (int rt = 0; rt < RT; ++rt) st.w[v][rt] = F::load(tile[rt], (size_t)(kb >> 5) / F::NK + v, lane);
+            for (int v = 0; v < VU; ++v) st.w[v][rt] = F::load(p + (rt * VU + v) * F::KB, lane);
 #pragma unroll
         for (int u = 0; u < U; ++u) {
 #pragma unroll
@@ -344,9 +342,9 @@ __device__ __forceinline__ void zero(float (&acc)[RT][MT][4]) {
 }
 
 // out[M, N] = x[M, KX] @ W[N, KW]^T. 256 threads; grid (N / (16 * RT), ksplit, ceil(M / 32));
-// ksplit > 1 runs as a (1, ksplit, 1) cluster; blockIdx.z picks 32 tokens. A CTA owns RT tiles
-// (16 * RT rows); its 8 warps split the CTA's K range and add their partials in shared memory
-// (reduce_store).
+// ksplit > 1 runs as a (1, ksplit, 1) cluster; blockIdx.z picks 32 tokens (all groups read the
+// same W stream). A CTA owns RT tiles (16 * RT rows); its 8 warps split the CTA's K range and
+// add their partials in shared memory (reduce_store). w is in stream order for this geometry.
 template <class F, int RT, int MT, int U, bool OUT_F32>
 __global__ void __launch_bounds__(256) ksplit_kernel(
         const __nv_bfloat16* __restrict__ x, const int4* __restrict__ w, const int2* __restrict__ exc,
@@ -356,14 +354,15 @@ __global__ void __launch_bounds__(256) ksplit_kernel(
     const int m0 = blockIdx.z * 32, Mz = min(M - m0, 32);
     x += (size_t)m0 * KX;
     const int kw = k_cta >> 3, k_begin = blockIdx.y * k_cta + warp * kw;
-    const int4* tile[RT];
-#pragma unroll
-    for (int rt = 0; rt < RT; ++rt) tile[rt] = tile_ptr<F>(w, blockIdx.x * RT + rt, KW);
+    constexpr int STEP = RT * (U / F::NK) * F::KB;  // int4s per warp step
+    const int gw = (blockIdx.y * gridDim.x + blockIdx.x) * 8 + warp;
+    const int4* wq = w + (size_t)gw * STEP;
+    const size_t sstride = (size_t)gridDim.x * gridDim.y * 8 * STEP;
     int2 ec[RT][2];
     if constexpr (F::EXC) exc_prefetch(ec, exc, blockIdx.x * RT);
     float acc[RT][MT][4];
     zero(acc);
-    mainloop<F, RT, MT, U>(acc, tile, x, KX, Mz, k_begin, k_begin + kw, basew);
+    mainloop<F, RT, MT, U>(acc, wq, sstride, x, KX, Mz, k_begin, k_begin + kw, basew);
     if constexpr (F::EXC) apply_exceptions(acc, ec, x, KX, Mz, k_begin, k_begin + kw);
     reduce_store<RT, MT, OUT_F32>(acc, red, out, blockIdx.x * 16 * RT, m0, Mz, N);
 }
@@ -532,10 +531,36 @@ def _out(x, layer, n):
 
 
 def pack_weight(w):
-    """[N, K] -> Plain format: per 16-row tile and 32-wide k block, rows 0-7 then rows 8-15,
-    each as lanes (row r, k quarter q) -> 16 bytes, lane = 4 * r + q."""
+    """[N, K] -> Plain units [N / 16, K / 32, 1024 bytes]: per 16-row tile and 32-wide k block,
+    rows 0-7 then rows 8-15, each as lanes (row r, k quarter q) -> 16 bytes, lane = 4 * r + q."""
     n, k = w.shape
-    return w.view(n // 16, 2, 8, k // 32, 4, 8).permute(0, 3, 1, 2, 4, 5).contiguous()
+    units = w.view(n // 16, 2, 8, k // 32, 4, 8).permute(0, 3, 1, 2, 4, 5).contiguous()
+    return units.view(torch.uint8).view(n // 16, k // 32, 1024)
+
+
+def pack_stream(units, nk, rt, u, ks):
+    """Units [tiles, n_units, bytes] (a unit holds nk k blocks of a tile) -> the order in which
+    ksplit_kernel with (rt, u, ks) reads them: a warp step is rt * (u / nk) units, and step s of
+    warp gw = (by * GX + bx) * 8 + warp sits at (s * G + gw) * step, so at each step the whole grid
+    reads one contiguous region. Warp (bx, by, warp) owns tiles bx * rt .. + rt - 1 and units
+    (by * 8 + warp) * per_warp .. + per_warp - 1 of each."""
+    tiles, nu, nbytes = units.shape
+    vu, per_warp = u // nk, nu // (ks * 8)
+    shape = (per_warp // vu, ks, tiles // rt, 8, rt, vu)
+    ix = [torch.arange(d, device=units.device).view([-1 if i == j else 1 for j in range(6)])
+          for i, d in enumerate(shape)]
+    s, by, bx, warp, r, v = ix
+    src = (bx * rt + r) * nu + (by * 8 + warp) * per_warp + s * vu + v
+    return units.reshape(tiles * nu, nbytes)[src.reshape(-1)].contiguous()
+
+
+def _stream(state, layer, n, kind, rt, u, ks):
+    """The stream-ordered weights for one launch geometry, packed once and cached."""
+    key = (layer, n, kind, rt, u, ks)
+    if key not in state["streams"]:
+        units = state["units"][layer] if kind == "cuda" else state["c12"][layer]["w12" if kind == "c12" else "w12w"]
+        state["streams"][key] = pack_stream(units[: n // 16], 2 if kind == "c12w" else 1, rt, u, ks)
+    return state["streams"][key]
 
 
 EXC_CAP = 64  # exception slots per 16-row tile (the CUDA constant of the same name)
@@ -599,13 +624,14 @@ def _proj(kind, x, state, layer, n, cfg):
     """Our kernel: kind "cuda" (Plain format), "c12" (C12) or "c12w" (C12W)."""
     rt, u, ksplit = cfg
     out = _out(x, layer, n)
+    w = _stream(state, layer, n, kind, rt, u, ksplit)
     if kind == "cuda":
-        w, k_x = _weight(state, layer)
-        _MOD.proj(x, state["packed"][layer], state["none"], out, 0, k_x, w.shape[1], rt, u, ksplit, 0)
+        k_x = state["router"].shape[1] if layer == "router" else x.shape[1]
+        _MOD.proj(x, w, state["none"], out, 0, k_x, state["units"][layer].shape[1] * 32, rt, u, ksplit, 0)
     else:
         c = state["c12"][layer]
-        _MOD.proj(x, c["w12" if kind == "c12" else "w12w"], c["exc"], out, 1 if kind == "c12" else 2,
-                  x.shape[1], x.shape[1], rt, u, ksplit, c["basew"])
+        _MOD.proj(x, w, c["exc"], out, 1 if kind == "c12" else 2, x.shape[1], x.shape[1], rt, u, ksplit,
+                  c["basew"])
     return out
 
 
@@ -649,10 +675,15 @@ def prepare(weights: Weights):
     if BENCH or any(kind == "mm_t" for kind, _ in PLAN.values()):
         state["wt"] = {name: state[name].t().contiguous() for name in ("qkv_gate", "o", "pooler", "unpooler")}
     state["plan"] = dict(PLAN)
-    state["packed"] = {name: pack_weight(state[name]) for name in ("qkv_gate", "o", "pooler", "unpooler")}
-    state["packed"]["router"] = pack_weight(state["router_hilo"])
+    state["units"] = {name: pack_weight(state[name]) for name in ("qkv_gate", "o", "pooler", "unpooler")}
+    state["units"]["router"] = pack_weight(state["router_hilo"])
     state["c12"] = {name: pack_c12(state[name]) for name in ("qkv_gate", "o", "pooler", "unpooler")}
     state["none"] = torch.zeros(1, device=dev, dtype=torch.int32)  # no exception list (Plain format)
+    state["streams"] = {}
+    for (layer, m), (kind, cfg) in PLAN.items():  # stream order for every planned launch
+        if kind in ("cuda", "c12", "c12w") and (kind == "cuda" or state["c12"].get(layer) is not None):
+            n = 1024 if layer == "unpooler" and m <= 8 else state["units"][layer].shape[0] * 16
+            _stream(state, layer, n, kind, *cfg)
     if BENCH or any(kind != "torch" for kind, _ in PLAN.values()):
         _cuda()
     if BENCH:
