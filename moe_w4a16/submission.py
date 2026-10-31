@@ -107,29 +107,20 @@ __device__ __forceinline__ uint32_t deq(uint32_t q, uint32_t s) {
     return *reinterpret_cast<const uint32_t*>(&v);
 }
 
-// Split each packed chunk into two pairs of K steps to shorten dequant fragment lifetimes.
-__device__ __forceinline__ void dequant_lo(const int4 c, uint32_t s_lo, uint32_t s_hi, uint32_t (&A)[2][4]) {
-    A[0][0] = deq<0>(c.x, s_lo); A[0][1] = deq<0>(c.z, s_hi);
-    A[0][2] = deq<1>(c.x, s_lo); A[0][3] = deq<1>(c.z, s_hi);
-    A[1][0] = deq<2>(c.x, s_lo); A[1][1] = deq<2>(c.z, s_hi);
-    A[1][2] = deq<3>(c.x, s_lo); A[1][3] = deq<3>(c.z, s_hi);
+// Four K steps of one chunk: c holds row g in x/y and row g + 8 in z/w.
+__device__ __forceinline__ void dequant_chunk(const int4 c, uint32_t s_lo, uint32_t s_hi, uint32_t (&A)[4][4]) {
+    const uint32_t x = c.x, y = c.y, z = c.z, w = c.w;
+    A[0][0] = deq<0>(x, s_lo); A[0][1] = deq<0>(z, s_hi); A[0][2] = deq<1>(x, s_lo); A[0][3] = deq<1>(z, s_hi);
+    A[1][0] = deq<2>(x, s_lo); A[1][1] = deq<2>(z, s_hi); A[1][2] = deq<3>(x, s_lo); A[1][3] = deq<3>(z, s_hi);
+    A[2][0] = deq<0>(y, s_lo); A[2][1] = deq<0>(w, s_hi); A[2][2] = deq<1>(y, s_lo); A[2][3] = deq<1>(w, s_hi);
+    A[3][0] = deq<2>(y, s_lo); A[3][1] = deq<2>(w, s_hi); A[3][2] = deq<3>(y, s_lo); A[3][3] = deq<3>(w, s_hi);
 }
 
-__device__ __forceinline__ void dequant_hi(const int4 c, uint32_t s_lo, uint32_t s_hi, uint32_t (&A)[2][4]) {
-    A[0][0] = deq<0>(c.y, s_lo); A[0][1] = deq<0>(c.w, s_hi);
-    A[0][2] = deq<1>(c.y, s_lo); A[0][3] = deq<1>(c.w, s_hi);
-    A[1][0] = deq<2>(c.y, s_lo); A[1][1] = deq<2>(c.w, s_hi);
-    A[1][2] = deq<3>(c.y, s_lo); A[1][3] = deq<3>(c.w, s_hi);
-}
-
-__device__ __forceinline__ void mma_lo(float (&acc)[4], const uint32_t (&A)[2][4], const int4 b01) {
+__device__ __forceinline__ void mma_chunk(float (&acc)[4], const uint32_t (&A)[4][4], const int4 b01, const int4 b23) {
     mma_bf16(acc, A[0][0], A[0][1], A[0][2], A[0][3], b01.x, b01.y);
     mma_bf16(acc, A[1][0], A[1][1], A[1][2], A[1][3], b01.z, b01.w);
-}
-
-__device__ __forceinline__ void mma_hi(float (&acc)[4], const uint32_t (&A)[2][4], const int4 b23) {
-    mma_bf16(acc, A[0][0], A[0][1], A[0][2], A[0][3], b23.x, b23.y);
-    mma_bf16(acc, A[1][0], A[1][1], A[1][2], A[1][3], b23.z, b23.w);
+    mma_bf16(acc, A[2][0], A[2][1], A[2][2], A[2][3], b23.x, b23.y);
+    mma_bf16(acc, A[3][0], A[3][1], A[3][2], A[3][3], b23.z, b23.w);
 }
 
 // meta (int32): [0] number of groups; then per group (at most MAX_GROUPS): local expert, first
@@ -150,14 +141,13 @@ __global__ void __launch_bounds__(1024) moe_route_kernel(const int* __restrict__
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-        const int group_size = n_ids <= 32 * TOPK ? 16 : 32;  // Smaller groups enable MT=2 at M=32.
         int off = 0, ng = 0;
         for (int e = 0; e < LOCAL; ++e) {
             cur[e] = off;
-            for (int g0 = 0; g0 < cnt[e] && ng < MAX_GROUPS; g0 += group_size, ++ng) {
+            for (int g0 = 0; g0 < cnt[e] && ng < MAX_GROUPS; g0 += 32, ++ng) {
                 meta[META_E + ng] = e;
                 meta[META_BEG + ng] = off + g0;
-                meta[META_N + ng] = min(group_size, cnt[e] - g0);
+                meta[META_N + ng] = min(32, cnt[e] - g0);
             }
             off += cnt[e];
         }
@@ -170,7 +160,7 @@ __global__ void __launch_bounds__(1024) moe_route_kernel(const int* __restrict__
     }
 }
 
-// Each warp prefetches all packed weight chunks, then dequantizes and consumes each half in order.
+// Each warp prefetches all packed weight chunks before dequantizing and using four K steps.
 template <int MT, int NCHUNK>
 __device__ __forceinline__ void warp_tile(const int4* __restrict__ cp, const int4* __restrict__ sp,
                                           const __nv_bfloat16* const (&brow)[MT], float (&acc)[MT][4]) {
@@ -182,20 +172,12 @@ __device__ __forceinline__ void warp_tile(const int4* __restrict__ cp, const int
 #pragma unroll
     for (int u = 0; u < NCHUNK; ++u) {
         const uint32_t sw = reinterpret_cast<const uint32_t*>(&s[u / U])[(u % U) >> 1] >> ((u & 1) * 16);
-        const uint32_t s_lo = scale2(sw & 0xffu), s_hi = scale2((sw >> 8) & 0xffu);
-        {
-            uint32_t A[2][4];
-            dequant_lo(w[u], s_lo, s_hi, A);
+        uint32_t A[4][4];
+        dequant_chunk(w[u], scale2(sw & 0xffu), scale2((sw >> 8) & 0xffu), A);
 #pragma unroll
-            for (int nt = 0; nt < MT; ++nt)
-                mma_lo(acc[nt], A, __ldg(reinterpret_cast<const int4*>(brow[nt] + u * 64)));
-        }
-        {
-            uint32_t A[2][4];
-            dequant_hi(w[u], s_lo, s_hi, A);
-#pragma unroll
-            for (int nt = 0; nt < MT; ++nt)
-                mma_hi(acc[nt], A, __ldg(reinterpret_cast<const int4*>(brow[nt] + u * 64) + 1));
+        for (int nt = 0; nt < MT; ++nt) {
+            const int4* p = reinterpret_cast<const int4*>(brow[nt] + u * 64);
+            mma_chunk(acc[nt], A, __ldg(p), __ldg(p + 1));
         }
     }
 }
@@ -428,14 +410,14 @@ cudaError_t moe_launch(const void* x, const int* ids, const float* wts, int M, i
     const int n_ids = M * TOPK;
     if (n_ids > 32 * MAX_GROUPS - 32 * LOCAL) return cudaErrorInvalidValue;  // groups always fit
     moe_route_kernel<<<1, 1024, 0, st>>>(ids, n_ids, local_start, meta, list);
-    // topk gives each token distinct experts: M<=8 uses MT=1, M<=32 uses groups of MT<=2.
+    // topk gives each token distinct experts: n<=M, so M<=8 uses MT=1 and M<=16 uses MT<=2.
     if (M <= 8) {
         const int small_grid = M == 8 ? grid + grid / 2 : grid;  // M=8 benefits from three blocks; M=1 does not.
         launch_up<1>((const __nv_bfloat16*)x, meta, list, local_start, (const int4*)c13, (const int4*)s13,
                      gs13, (__nv_bfloat16*)act, small_grid, st);
         launch_down<1>((const __nv_bfloat16*)act, meta, list, local_start, (const int4*)c2, (const int4*)s2,
                        gs2, (__nv_bfloat16*)ybuf, small_grid, st);
-    } else if (M <= 32) {
+    } else if (M <= 16) {
         launch_up<2>((const __nv_bfloat16*)x, meta, list, local_start, (const int4*)c13, (const int4*)s13,
                      gs13, (__nv_bfloat16*)act, grid, st);
         launch_down<2>((const __nv_bfloat16*)act, meta, list, local_start, (const int4*)c2, (const int4*)s2,
