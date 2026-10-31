@@ -235,12 +235,17 @@ struct C12W {  // pack_c12 "w12w": per 2 k blocks 1536 bytes, sign | mantissa of
 // instead of 1000+ warps each walking their own far-apart stream.
 // acc[rt] += W[rows of tile rt] @ x^T over k in [k_begin, k_end), for tokens 0 .. Mz - 1 of x
 // (row stride KX; W column k meets x column k % KX, which lets the router read [hi | lo]).
-// DIAG (timing probes only, wrong results): 1 no decode, 4 no MMA, 8 no x loads.
+// Formats with EXC: esc is this warp's escape list (pack_escapes in Python): up to 32 entries, one
+// per lane, sorted by seq = k block index within the warp * RT + rt: seq << 17 | lane << 12 |
+// register << 9 | half << 8 | the 8-bit XOR that turns the decoded exponent into the true one
+// (0xFFFFFFFF ends the list). The owning lane patches its decoded register before the MMA.
+// DIAG (timing probes only, wrong results): 1 no decode, 2 no escapes, 4 no MMA, 8 no x loads.
 template <class F, int RT, int MT, int U, int DIAG = 0>
 __device__ __forceinline__ void mainloop(float (&acc)[RT][MT][4], const int4* wq, size_t sstride,
                                          const __nv_bfloat16* x, int KX, int Mz, int k_begin, int k_end,
-                                         uint32_t basew) {
+                                         uint32_t basew, const uint32_t* esc) {
     constexpr int VU = U / F::NK;
+    constexpr bool ESC = F::EXC && !(DIAG & 2);
     const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
     const __nv_bfloat16* xrow[MT];
     bool xok[MT];
@@ -250,11 +255,15 @@ __device__ __forceinline__ void mainloop(float (&acc)[RT][MT][4], const int4* wq
         xok[nt] = tok < Mz;
         xrow[nt] = x + (size_t)(xok[nt] ? tok : 0) * KX + t * 8;
     }
+    uint32_t my_e = 0xFFFFFFFFu, nxt = 0xFFFFFFFFu;
+    int ep = 0;
+    if constexpr (ESC) my_e = __ldg(esc + lane);
     static_assert(U % F::NK == 0, "a step holds whole format units");
-    struct Stage { typename F::Raw w[VU][RT]; int4 xv[U][MT]; };
+    struct Stage { typename F::Raw w[VU][RT]; int4 xv[U][MT]; int s; };
     auto load = [&](Stage& st, int kb) {
         const int kx = kb % KX;
-        const int4* p = wq + (size_t)((kb - k_begin) / (32 * U)) * sstride;
+        st.s = (kb - k_begin) / (32 * U);
+        const int4* p = wq + (size_t)st.s * sstride;
 #pragma unroll
         for (int rt = 0; rt < RT; ++rt)
 #pragma unroll
@@ -281,6 +290,21 @@ __device__ __forceinline__ void mainloop(float (&acc)[RT][MT][4], const int4* wq
                 } else {
                     F::frag(st.w[u / F::NK][rt], u % F::NK, basew, a, b);
                 }
+                if constexpr (ESC) {
+                    const uint32_t seq = (uint32_t)((st.s * U + u) * RT + rt);
+                    while ((nxt >> 17) == seq) {  // nxt is the same in all lanes: no divergence
+                        if (lane == (int)((nxt >> 12) & 31)) {
+                            const uint32_t reg = (nxt >> 9) & 7, xr = (nxt & 0xFF) << (7 + ((nxt >> 8) & 1) * 16);
+#pragma unroll
+                            for (int i = 0; i < 4; ++i) {
+                                if (reg == (uint32_t)i) a[i] ^= xr;
+                                if (reg == (uint32_t)(4 + i)) b[i] ^= xr;
+                            }
+                        }
+                        ++ep;
+                        nxt = ep < 32 ? __shfl_sync(0xFFFFFFFFu, my_e, ep) : 0xFFFFFFFFu;
+                    }
+                }
 #pragma unroll
                 for (int nt = 0; nt < MT; ++nt) {
                     if constexpr (DIAG & 4) {  // fold the operands instead of the MMA
@@ -293,55 +317,10 @@ __device__ __forceinline__ void mainloop(float (&acc)[RT][MT][4], const int4* wq
                 }
             }
     };
+    if constexpr (ESC) nxt = __shfl_sync(0xFFFFFFFFu, my_e, 0);
     pipeline2<U, Stage>(k_begin, k_end, load, compute);
 }
 
-// C12 exceptions. pack_c12 stores them in EXC_CAP (64) slots per tile, sorted by k, padded with
-// 0xFFFF: entry (k | row << 16, w_true | w_decoded << 16). Lane i loads slots i and 32 + i at
-// kernel start (no dependent load, so the latency hides under the main loop).
-constexpr int EXC_CAP = 64;
-template <int RT>
-__device__ __forceinline__ void exc_prefetch(int2 (&ec)[RT][2], const int2* __restrict__ exc, int tile0) {
-    const int lane = threadIdx.x & 31;
-#pragma unroll
-    for (int rt = 0; rt < RT; ++rt)
-#pragma unroll
-        for (int c = 0; c < 2; ++c) ec[rt][c] = __ldg(exc + (size_t)(tile0 + rt) * EXC_CAP + c * 32 + lane);
-}
-
-// For the exceptions with k in [k_lo, k_hi), the lanes holding the row add
-// w_true * x - w_decoded * x for their two tokens per 8-token tile.
-template <int RT, int MT>
-__device__ __forceinline__ void apply_exceptions(float (&acc)[RT][MT][4], const int2 (&ec)[RT][2],
-                                                 const __nv_bfloat16* x, int K, int Mz, int k_lo, int k_hi) {
-    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
-#pragma unroll
-    for (int rt = 0; rt < RT; ++rt)
-#pragma unroll
-        for (int c = 0; c < 2; ++c)
-            for (int i = 0; i < 32; ++i) {
-                const int ex = __shfl_sync(0xFFFFFFFFu, ec[rt][c].x, i);
-                if (ex == 0xFFFF) break;  // padding: the rest of the slots are empty
-                const int ey = __shfl_sync(0xFFFFFFFFu, ec[rt][c].y, i);
-                const int k = ex & 0xFFFF, r = ex >> 16;
-                if (k < k_lo || k >= k_hi || (r & 7) != g) continue;
-                const float wt = __uint_as_float((uint32_t)ey << 16);
-                const float wd = __uint_as_float((uint32_t)ey & 0xFFFF0000u);
-                const bool hi = r >= 8;
-#pragma unroll
-                for (int nt = 0; nt < MT; ++nt) {
-                    const int tok = nt * 8 + 2 * t;
-                    const float x0 = tok < Mz ? __bfloat162float(x[(size_t)tok * K + k]) : 0.f;
-                    const float x1 = tok + 1 < Mz ? __bfloat162float(x[(size_t)(tok + 1) * K + k]) : 0.f;
-                    float c0 = hi ? acc[rt][nt][2] : acc[rt][nt][0];
-                    float c1 = hi ? acc[rt][nt][3] : acc[rt][nt][1];
-                    c0 = fmaf(wt, x0, fmaf(-wd, x0, c0));
-                    c1 = fmaf(wt, x1, fmaf(-wd, x1, c1));
-                    if (hi) { acc[rt][nt][2] = c0; acc[rt][nt][3] = c1; }
-                    else    { acc[rt][nt][0] = c0; acc[rt][nt][1] = c1; }
-                }
-            }
-}
 
 template <int RT, int MT>
 __device__ __forceinline__ void zero(float (&acc)[RT][MT][4]) {
@@ -359,13 +338,13 @@ __device__ __forceinline__ void zero(float (&acc)[RT][MT][4]) {
 // (blockIdx.x * WR + wr) * RT .. + RT - 1 and the wk-th of WK slices of the CTA's K range. The WR
 // row groups share x through L1; the WK k-warps add their partials in shared memory
 // (reduce_store). w is in stream order for this geometry.
-template <class F, int RT, int MT, int U, bool OUT_F32, int WR, int WK, int DIAG = 0>  // DIAG 2: no exceptions
+template <class F, int RT, int MT, int U, bool OUT_F32, int WR, int WK, int DIAG = 0>
 __global__ void __launch_bounds__(WR * WK * 32) ksplit_kernel(
-        const __nv_bfloat16* __restrict__ x, const int4* __restrict__ w, const int2* __restrict__ exc,
+        const __nv_bfloat16* __restrict__ x, const int4* __restrict__ w, const uint32_t* __restrict__ esc,
         void* __restrict__ out, int M, int N, int KX, int KW, int k_cta, uint32_t basew) {
     constexpr int NW = WR * WK;
     __shared__ float red[NW * RT * MT * 128];
-    const int warp = threadIdx.x >> 5, wr = warp % WR, wk = warp / WR;
+    const int warp = threadIdx.x >> 5, wk = warp / WR;
     const int m0 = blockIdx.z * 32, Mz = min(M - m0, 32);
     x += (size_t)m0 * KX;
     const int kw = k_cta / WK, k_begin = blockIdx.y * k_cta + wk * kw;
@@ -373,18 +352,14 @@ __global__ void __launch_bounds__(WR * WK * 32) ksplit_kernel(
     const int gw = (blockIdx.y * gridDim.x + blockIdx.x) * NW + warp;
     const int4* wq = w + (size_t)gw * STEP;
     const size_t sstride = (size_t)gridDim.x * gridDim.y * NW * STEP;
-    const int tile0 = (blockIdx.x * WR + wr) * RT;
-    int2 ec[RT][2];
-    if constexpr (F::EXC && !(DIAG & 2)) exc_prefetch(ec, exc, tile0);
     float acc[RT][MT][4];
     zero(acc);
-    mainloop<F, RT, MT, U, DIAG>(acc, wq, sstride, x, KX, Mz, k_begin, k_begin + kw, basew);
-    if constexpr (F::EXC && !(DIAG & 2)) apply_exceptions(acc, ec, x, KX, Mz, k_begin, k_begin + kw);
+    mainloop<F, RT, MT, U, DIAG>(acc, wq, sstride, x, KX, Mz, k_begin, k_begin + kw, basew, esc + (size_t)gw * 32);
     reduce_store<RT, MT, OUT_F32, WR, WK>(acc, red, out, blockIdx.x * 16 * RT * WR, m0, Mz, N);
 }
 
 struct Args {
-    const __nv_bfloat16* x; const int4* w; const int2* exc; void* out;
+    const __nv_bfloat16* x; const int4* w; const uint32_t* esc; void* out;
     int M, N, KX, KW, k_cta; uint32_t basew;
 };
 
@@ -394,7 +369,7 @@ cudaError_t diag_launch(const void* x, const void* w, const void* exc, void* out
     const dim3 grid(N / 16, 1, (M + 31) / 32), block(256);
     auto xp = static_cast<const __nv_bfloat16*>(x);
     auto wp = static_cast<const int4*>(w);
-    auto ep = static_cast<const int2*>(exc);
+    auto ep = static_cast<const uint32_t*>(exc);
     if (diag == 1) ksplit_kernel<C12, 1, 1, 4, false, 1, 8, 1><<<grid, block, 0, stream>>>(xp, wp, ep, out, M, N, K, K, K, basew);
     else if (diag == 2) ksplit_kernel<C12, 1, 1, 4, false, 1, 8, 2><<<grid, block, 0, stream>>>(xp, wp, ep, out, M, N, K, K, K, basew);
     else if (diag == 4) ksplit_kernel<C12, 1, 1, 4, false, 1, 8, 4><<<grid, block, 0, stream>>>(xp, wp, ep, out, M, N, K, K, K, basew);
@@ -411,7 +386,7 @@ static cudaError_t go(cudaLaunchConfig_t* cfg, const Args& a) {
         const cudaError_t e = cudaFuncSetAttribute(kern, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
         if (e != cudaSuccess) return e;
     }
-    return cudaLaunchKernelEx(cfg, kern, a.x, a.w, a.exc, a.out, a.M, a.N, a.KX, a.KW, a.k_cta, a.basew);
+    return cudaLaunchKernelEx(cfg, kern, a.x, a.w, a.esc, a.out, a.M, a.N, a.KX, a.KW, a.k_cta, a.basew);
 }
 
 // Warp grids (WR, WK): 0 = (1, 8) 256 threads, 1 = (2, 8) 512, 2 = (2, 16) 1024, 3 = (4, 8) 1024.
@@ -484,7 +459,7 @@ cudaError_t proj_launch(int fmt, bool f32, const void* x, const void* w, const v
     cfg.attrs = attr;
     cfg.numAttrs = ksplit > 1 ? 1 : 0;
     const int mt = M <= 8 ? 1 : M <= 16 ? 2 : 4;
-    const Args a{static_cast<const __nv_bfloat16*>(x), static_cast<const int4*>(w), static_cast<const int2*>(exc),
+    const Args a{static_cast<const __nv_bfloat16*>(x), static_cast<const int4*>(w), static_cast<const uint32_t*>(exc),
                  out, M, N, KX, KW, KW / ksplit, basew};
     if (fmt == 1) return pick<C12, false>(&cfg, g, rt, mt, u, a);
     if (fmt == 2) return pick<C12W, false>(&cfg, g, rt, mt, u, a);
@@ -705,25 +680,29 @@ def pack_stream(units, nk, rt, u, ks, g):
 
 
 def _stream(state, layer, n, kind, rt, u, ks, g):
-    """The stream-ordered weights for one launch geometry, packed once and cached."""
+    """(stream-ordered weights, per-warp escape lists) for one launch geometry, packed once and cached.
+    Raises ValueError if a warp would need more than 32 escapes."""
     key = (layer, n, kind, rt, u, ks, g)
     if key not in state["streams"]:
-        units = state["units"][layer] if kind == "cuda" else state["c12"][layer]["w12" if kind == "c12" else "w12w"]
-        state["streams"][key] = pack_stream(units[: n // 16], 2 if kind == "c12w" else 1, rt, u, ks, g)
+        if kind == "cuda":
+            w = pack_stream(state["units"][layer][: n // 16], 1, rt, u, ks, g)
+            state["streams"][key] = (w, state["none"])
+        else:
+            c = state["c12"][layer]
+            units = c["w12" if kind == "c12" else "w12w"][: n // 16]
+            esc = pack_escapes(c, n, rt, u, ks, g)
+            state["streams"][key] = (pack_stream(units, 2 if kind == "c12w" else 1, rt, u, ks, g), esc)
     return state["streams"][key]
 
 
-EXC_CAP = 64  # exception slots per 16-row tile (the CUDA constant of the same name)
-
-
 def pack_c12(w):
-    """BF16 [N, K] -> lossless 12-bit code (C12 and C12W formats), or None if it does not fit.
+    """BF16 [N, K] -> lossless 12-bit code (C12 and C12W formats) and its escapes.
 
     base = (largest exponent field) - 15. A value with exponent e in [base, base + 15] keeps its
     sign and 7 mantissa bits as one byte and stores e - base as a 4-bit code. A value below the
-    window (tiny values, zeros; about 1e-4 of Gaussian weights) gets code 0, so it decodes to
-    sign | base | mantissa, and goes to its tile's exception slots with its true and decoded
-    bits: EXC_CAP slots per tile, sorted by k, padded with k = 0xFFFF.
+    window (tiny values, zeros; about 1e-4 of Gaussian weights) is an escape: code 0 (so it
+    decodes with exponent base) plus a list entry with the XOR base ^ e (pack_escapes), which the
+    kernel applies to the decoded register before the MMA. So the kernel multiplies exactly W.
     Per 16-row tile and 32-wide k block, lane 4g + t holds 16 sign | mantissa bytes (row g then
     row g + 8, k 8t .. 8t + 7) and 8 code bytes: one 32-bit word per row, pair j (k 2j, 2j + 1)
     at nibbles j and j + 4.
@@ -736,11 +715,6 @@ def pack_c12(w):
     e = (bits >> 7) & 0xFF
     base = max(int(e.max()) - 15, 0)
     exc = e < base
-    rows, cols = exc.nonzero(as_tuple=True)
-    tile_of = rows.long() // 16
-    counts = torch.bincount(tile_of, minlength=tiles)
-    if int(counts.max()) > EXC_CAP:
-        return None
     code = torch.where(exc, 0, e - base)
     sm = ((bits >> 8) & 0x80) | (bits & 0x7F)
 
@@ -750,38 +724,52 @@ def pack_c12(w):
     c = frag(code)[..., [0, 2, 4, 6, 1, 3, 5, 7]]  # nibble order inside each 32-bit word
     sm_b = frag(sm).to(torch.uint8).reshape(tiles, nb, 512)
     ex_b = (c[..., 0::2] | (c[..., 1::2] << 4)).to(torch.uint8).reshape(tiles, nb, 32, 8)
-
-    order = torch.argsort(tile_of * k + cols)  # nonzero() is row-major: sort by tile, then k
-    rows, cols, tile_of = rows[order].long(), cols[order].long(), tile_of[order]
-    true_bits = bits[rows, cols].long()
-    hi = true_bits | (((true_bits & 0x807F) | (base << 7)) << 16)
-    slot = tile_of * EXC_CAP + torch.arange(len(rows), device=w.device) - (counts.cumsum(0) - counts)[tile_of]
-    slots = torch.zeros((tiles * EXC_CAP, 2), dtype=torch.int64, device=w.device)
-    slots[:, 0] = 0xFFFF
-    slots[slot, 0] = cols | ((rows % 16) << 16)
-    slots[slot, 1] = torch.where(hi >= 1 << 31, hi - (1 << 32), hi)
+    rows, cols = exc.nonzero(as_tuple=True)
     return {
         "w12": torch.cat([sm_b, ex_b.reshape(tiles, nb, 256)], 2).contiguous(),
         "w12w": torch.cat([sm_b.reshape(tiles, nb // 2, 1024),
                            ex_b.reshape(tiles, nb // 2, 2, 32, 8).transpose(2, 3).reshape(tiles, nb // 2, 512)],
                           2).contiguous(),
-        "exc": slots.to(torch.int32).contiguous(),
+        "exc_rows": rows.long(), "exc_cols": cols.long(), "exc_xor": (e[rows, cols] ^ base).long(), "k": k,
         "basew": base << 7 | base << 23,
     }
+
+
+def pack_escapes(c, n, rt, u, ks, g):
+    """Per-warp escape lists for ksplit_kernel with (rt, u, ks, warp grid g) on rows 0 .. n - 1:
+    int32 [G * 32], warp gw's entries at gw * 32 .., sorted by seq = (k block within the warp) * rt
+    + tile within the warp, padded with -1. Entry: seq << 17 | lane << 12 | register << 9 |
+    half << 8 | XOR of the exponent field. Raises ValueError if a warp needs more than 32."""
+    wr_n, wk_n = GEOMS[g]
+    keep = c["exc_rows"] < n
+    rows, cols, xr = c["exc_rows"][keep], c["exc_cols"][keep], c["exc_xor"][keep]
+    gx, nw, per_cta = n // (16 * rt * wr_n), wr_n * wk_n, c["k"] // 32 // ks
+    per_warp = per_cta // wk_n
+    tile, r, kb, kk = rows // 16, rows % 16, cols // 32, cols % 32
+    gw = (kb // per_cta * gx + tile // (rt * wr_n)) * nw + (kb % per_cta) // per_warp * wr_n + (tile // rt) % wr_n
+    seq = (kb % per_warp) * rt + tile % rt
+    entry = (seq << 17) | ((r % 8 * 4 + kk // 8) << 12) | (((r >= 8).long() * 4 + kk % 8 // 2) << 9) | ((kk % 2) << 8) | xr
+    order = torch.argsort(gw * (1 << 20) + seq)
+    gw, entry = gw[order], entry[order]
+    rank = torch.arange(len(gw), device=gw.device) - torch.searchsorted(gw, gw)
+    if len(gw) and int(rank.max()) >= 32:
+        raise ValueError("more than 32 escapes in one warp")
+    esc = torch.full((gx * ks * nw * 32,), -1, dtype=torch.int64, device=gw.device)
+    esc[gw * 32 + rank] = entry
+    return esc.to(torch.int32)
 
 
 def _proj(kind, x, state, layer, n, cfg):
     """Our kernel: kind "cuda" (Plain format), "c12" (C12) or "c12w" (C12W); cfg (rt, u, ksplit, g)."""
     rt, u, ksplit, g = cfg
     out = _out(x, layer, n)
-    w = _stream(state, layer, n, kind, rt, u, ksplit, g)
+    w, esc = _stream(state, layer, n, kind, rt, u, ksplit, g)
     if kind == "cuda":
         k_x = state["router"].shape[1] if layer == "router" else x.shape[1]
-        _MOD.proj(x, w, state["none"], out, 0, k_x, state["units"][layer].shape[1] * 32, g, rt, u, ksplit, 0)
+        _MOD.proj(x, w, esc, out, 0, k_x, state["units"][layer].shape[1] * 32, g, rt, u, ksplit, 0)
     else:
-        c = state["c12"][layer]
-        _MOD.proj(x, w, c["exc"], out, 1 if kind == "c12" else 2, x.shape[1], x.shape[1], g, rt, u, ksplit,
-                  c["basew"])
+        _MOD.proj(x, w, esc, out, 1 if kind == "c12" else 2, x.shape[1], x.shape[1], g, rt, u, ksplit,
+                  state["c12"][layer]["basew"])
     return out
 
 
@@ -839,12 +827,16 @@ def prepare(weights: Weights):
     state["units"] = {name: pack_weight(state[name]) for name in ("qkv_gate", "o", "pooler", "unpooler")}
     state["units"]["router"] = pack_weight(state["router_hilo"])
     state["c12"] = {name: pack_c12(state[name]) for name in ("qkv_gate", "o", "pooler", "unpooler")}
-    state["none"] = torch.zeros(1, device=dev, dtype=torch.int32)  # no exception list (Plain format)
+    state["none"] = torch.zeros(1, device=dev, dtype=torch.int32)  # no escape list (Plain format)
     state["streams"] = {}
     for (layer, m), (kind, cfg) in PLAN.items():  # stream order for every planned launch
-        if kind in ("cuda", "c12", "c12w") and (kind == "cuda" or state["c12"].get(layer) is not None):
+        if kind in ("cuda", "c12", "c12w"):
             n = 1024 if layer == "unpooler" and m <= 8 else state["units"][layer].shape[0] * 16
-            _stream(state, layer, n, kind, *cfg)
+            try:
+                _stream(state, layer, n, kind, *cfg)
+            except ValueError:  # these weights need more escapes per warp: same launch, plain weights
+                state["plan"][(layer, m)] = ("cuda", cfg)
+                _stream(state, layer, n, "cuda", *cfg)
     if BENCH or any(kind != "torch" for kind, _ in PLAN.values()):
         _cuda()
     if BENCH:
@@ -954,11 +946,11 @@ def _sweep(state, budget_s=150.0):
     rows, load_t, probes = [], {}, {}
     if _MOD and state["c12"].get("pooler") is not None:  # where the 12-bit kernel's time goes
         x1 = torch.randn((1, 8192), device=dev).to(torch.bfloat16)
-        c, ws = state["c12"]["pooler"], _stream(state, "pooler", 4096, "c12", 1, 4, 1, 0)
+        c, (ws, esc) = state["c12"]["pooler"], _stream(state, "pooler", 4096, "c12", 1, 4, 1, 0)
         o1 = torch.empty((1, 4096), device=dev, dtype=torch.bfloat16)
         res = {"full": _graph_us(lambda: _proj("c12", x1, state, "pooler", 4096, (1, 4, 1, 0)), flush)[0]}
-        for d, name in ((1, "no decode"), (2, "no exceptions"), (4, "no mma"), (8, "no x"), (15, "loads only")):
-            res[name] = _graph_us(lambda: (_MOD.diag(x1, ws, c["exc"], o1, c["basew"], d), o1)[1], flush)[0]
+        for d, name in ((1, "no decode"), (2, "no escapes"), (4, "no mma"), (8, "no x"), (15, "loads only")):
+            res[name] = _graph_us(lambda: (_MOD.diag(x1, ws, esc, o1, c["basew"], d), o1)[1], flush)[0]
         print("DIAG pooler m=1 c12[1,4,1,0] net us: " + " ".join(f"{k}={v - FIXED_US:.2f}" for k, v in res.items()),
               flush=True)
     for m in BUCKETS:
