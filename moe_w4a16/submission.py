@@ -87,6 +87,12 @@ __device__ __forceinline__ void mma_bf16(float* c, uint32_t a0, uint32_t a1, uin
 
 // E4M3 block scale byte -> BF16 (scale * 2^118) in both halves.
 __device__ __forceinline__ uint32_t scale2(uint32_t b) {
+    // Normal E4M3 values fit BF16 exactly after the exponent offset.
+    if ((b & 0x78u) && ((b & 0x7fu) != 0x7fu)) {
+        const uint32_t u = ((b & 0x80u) << 8) | (((b & 0x7fu) << 4) + 0x7700u);
+        return u | (u << 16);
+    }
+    // Preserve zero, subnormal and NaN behavior for unusual scale bytes.
     uint32_t h2;
     const unsigned short dup = (unsigned short)(b | (b << 8));
     asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h2) : "h"(dup));
