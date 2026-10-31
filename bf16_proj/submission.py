@@ -136,6 +136,7 @@ __device__ __forceinline__ void reduce_store(float (&acc)[RT][MT][4], float (*re
 #pragma unroll
                 for (int j = 0; j < 4; ++j) red[warp][((rt * MT + nt) * 4 + j) * 32 + lane] = acc[rt][nt][j];
     __syncthreads();
+#pragma unroll 1  // rolled loops keep the kernel small: its code comes from HBM on every call
     for (int e = threadIdx.x; e < E; e += 256) red[0][e] = red[0][e] + red[1][e] + red[2][e] + red[3][e];
 
     const int ksplit = gridDim.y;
@@ -145,13 +146,17 @@ __device__ __forceinline__ void reduce_store(float (&acc)[RT][MT][4], float (*re
         cluster.sync();
         writer = cluster.block_rank() == 0;
         if (writer)
-            for (int e = threadIdx.x; e < E; e += 256)
-                for (int r = 1; r < ksplit; ++r) red[0][e] += cluster.map_shared_rank(&red[0][0], r)[e];
+            for (int r = 1; r < ksplit; ++r) {
+                const float* other = cluster.map_shared_rank(&red[0][0], r);
+#pragma unroll 1
+                for (int e = threadIdx.x; e < E; e += 256) red[0][e] += other[e];
+            }
         cluster.sync();  // the others' shared memory must outlive rank 0's reads
     } else {
         __syncthreads();
     }
     if (!writer) return;
+#pragma unroll 1
     for (int e = threadIdx.x; e < E; e += 256) {
         const int ln = e & 31, j = (e >> 5) & 3, nt = (e >> 7) % MT, rt = (e >> 7) / MT;
         const int row = row0 + rt * 16 + (ln >> 2) + (j >= 2 ? 8 : 0);
@@ -307,8 +312,7 @@ __device__ __forceinline__ void apply_exceptions(float (&acc)[RT][MT][4], const 
     for (int rt = 0; rt < RT; ++rt)
 #pragma unroll
         for (int c = 0; c < 2; ++c)
-#pragma unroll 1  // rolled: unrolled, this loop made the kernel up to 170 KB of code, fetched
-            for (int i = 0; i < 32; ++i) {  // from HBM on every call (the judge flushes L2)
+            for (int i = 0; i < 32; ++i) {
                 const int ex = __shfl_sync(0xFFFFFFFFu, ec[rt][c].x, i);
                 if (ex == 0xFFFF) break;  // padding: the rest of the slots are empty
                 const int ey = __shfl_sync(0xFFFFFFFFu, ec[rt][c].y, i);
