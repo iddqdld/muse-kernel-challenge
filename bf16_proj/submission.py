@@ -31,7 +31,7 @@ from typing import TypedDict
 import torch
 import torch.nn.functional as F
 
-BENCH = False
+BENCH = True
 
 
 class Weights(TypedDict):
@@ -235,7 +235,8 @@ struct C12W {  // pack_c12 "w12w": per 2 k blocks 1536 bytes, sign | mantissa of
 // instead of 1000+ warps each walking their own far-apart stream.
 // acc[rt] += W[rows of tile rt] @ x^T over k in [k_begin, k_end), for tokens 0 .. Mz - 1 of x
 // (row stride KX; W column k meets x column k % KX, which lets the router read [hi | lo]).
-template <class F, int RT, int MT, int U>
+// DIAG (timing probes only, wrong results): 1 no decode, 4 no MMA, 8 no x loads.
+template <class F, int RT, int MT, int U, int DIAG = 0>
 __device__ __forceinline__ void mainloop(float (&acc)[RT][MT][4], const int4* wq, size_t sstride,
                                          const __nv_bfloat16* x, int KX, int Mz, int k_begin, int k_end,
                                          uint32_t basew) {
@@ -262,7 +263,8 @@ __device__ __forceinline__ void mainloop(float (&acc)[RT][MT][4], const int4* wq
         for (int u = 0; u < U; ++u) {
 #pragma unroll
             for (int nt = 0; nt < MT; ++nt)
-                st.xv[u][nt] = xok[nt] ? __ldg(reinterpret_cast<const int4*>(xrow[nt] + kx + u * 32))
+                st.xv[u][nt] = (DIAG & 8) ? make_int4(0x3F803F80, 0x3F803F80, 0x3F803F80, 0x3F803F80)
+                             : xok[nt] ? __ldg(reinterpret_cast<const int4*>(xrow[nt] + kx + u * 32))
                                        : make_int4(0, 0, 0, 0);
         }
     };
@@ -272,11 +274,22 @@ __device__ __forceinline__ void mainloop(float (&acc)[RT][MT][4], const int4* wq
 #pragma unroll
             for (int rt = 0; rt < RT; ++rt) {
                 int a[4], b[4];
-                F::frag(st.w[u / F::NK][rt], u % F::NK, basew, a, b);
+                if constexpr (DIAG & 1) {  // the raw bits, no decode
+                    const int* r = reinterpret_cast<const int*>(&st.w[u / F::NK][rt]);
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) { a[i] = r[i]; b[i] = r[i] ^ r[4]; }
+                } else {
+                    F::frag(st.w[u / F::NK][rt], u % F::NK, basew, a, b);
+                }
 #pragma unroll
                 for (int nt = 0; nt < MT; ++nt) {
-                    mma_bf16(acc[rt][nt], a[0], b[0], a[1], b[1], st.xv[u][nt].x, st.xv[u][nt].y);
-                    mma_bf16(acc[rt][nt], a[2], b[2], a[3], b[3], st.xv[u][nt].z, st.xv[u][nt].w);
+                    if constexpr (DIAG & 4) {  // fold the operands instead of the MMA
+                        acc[rt][nt][0] += __int_as_float((a[0] ^ a[1] ^ a[2] ^ a[3] ^ b[0] ^ b[1] ^ b[2] ^ b[3] ^
+                                                          st.xv[u][nt].x ^ st.xv[u][nt].w) & 0x3FFFFFFF);
+                    } else {
+                        mma_bf16(acc[rt][nt], a[0], b[0], a[1], b[1], st.xv[u][nt].x, st.xv[u][nt].y);
+                        mma_bf16(acc[rt][nt], a[2], b[2], a[3], b[3], st.xv[u][nt].z, st.xv[u][nt].w);
+                    }
                 }
             }
     };
@@ -346,7 +359,7 @@ __device__ __forceinline__ void zero(float (&acc)[RT][MT][4]) {
 // (blockIdx.x * WR + wr) * RT .. + RT - 1 and the wk-th of WK slices of the CTA's K range. The WR
 // row groups share x through L1; the WK k-warps add their partials in shared memory
 // (reduce_store). w is in stream order for this geometry.
-template <class F, int RT, int MT, int U, bool OUT_F32, int WR, int WK>
+template <class F, int RT, int MT, int U, bool OUT_F32, int WR, int WK, int DIAG = 0>  // DIAG 2: no exceptions
 __global__ void __launch_bounds__(WR * WK * 32) ksplit_kernel(
         const __nv_bfloat16* __restrict__ x, const int4* __restrict__ w, const int2* __restrict__ exc,
         void* __restrict__ out, int M, int N, int KX, int KW, int k_cta, uint32_t basew) {
@@ -362,11 +375,11 @@ __global__ void __launch_bounds__(WR * WK * 32) ksplit_kernel(
     const size_t sstride = (size_t)gridDim.x * gridDim.y * NW * STEP;
     const int tile0 = (blockIdx.x * WR + wr) * RT;
     int2 ec[RT][2];
-    if constexpr (F::EXC) exc_prefetch(ec, exc, tile0);
+    if constexpr (F::EXC && !(DIAG & 2)) exc_prefetch(ec, exc, tile0);
     float acc[RT][MT][4];
     zero(acc);
-    mainloop<F, RT, MT, U>(acc, wq, sstride, x, KX, Mz, k_begin, k_begin + kw, basew);
-    if constexpr (F::EXC) apply_exceptions(acc, ec, x, KX, Mz, k_begin, k_begin + kw);
+    mainloop<F, RT, MT, U, DIAG>(acc, wq, sstride, x, KX, Mz, k_begin, k_begin + kw, basew);
+    if constexpr (F::EXC && !(DIAG & 2)) apply_exceptions(acc, ec, x, KX, Mz, k_begin, k_begin + kw);
     reduce_store<RT, MT, OUT_F32, WR, WK>(acc, red, out, blockIdx.x * 16 * RT * WR, m0, Mz, N);
 }
 
@@ -374,6 +387,22 @@ struct Args {
     const __nv_bfloat16* x; const int4* w; const int2* exc; void* out;
     int M, N, KX, KW, k_cta; uint32_t basew;
 };
+
+// Timing probe: C12, RT 1, MT 1, U 4, warp grid (1, 8), ksplit 1, with DIAG bits (see mainloop).
+cudaError_t diag_launch(const void* x, const void* w, const void* exc, void* out, int M, int N, int K,
+                        uint32_t basew, int diag, cudaStream_t stream) {
+    const dim3 grid(N / 16, 1, (M + 31) / 32), block(256);
+    auto xp = static_cast<const __nv_bfloat16*>(x);
+    auto wp = static_cast<const int4*>(w);
+    auto ep = static_cast<const int2*>(exc);
+    if (diag == 1) ksplit_kernel<C12, 1, 1, 4, false, 1, 8, 1><<<grid, block, 0, stream>>>(xp, wp, ep, out, M, N, K, K, K, basew);
+    else if (diag == 2) ksplit_kernel<C12, 1, 1, 4, false, 1, 8, 2><<<grid, block, 0, stream>>>(xp, wp, ep, out, M, N, K, K, K, basew);
+    else if (diag == 4) ksplit_kernel<C12, 1, 1, 4, false, 1, 8, 4><<<grid, block, 0, stream>>>(xp, wp, ep, out, M, N, K, K, K, basew);
+    else if (diag == 8) ksplit_kernel<C12, 1, 1, 4, false, 1, 8, 8><<<grid, block, 0, stream>>>(xp, wp, ep, out, M, N, K, K, K, basew);
+    else if (diag == 15) ksplit_kernel<C12, 1, 1, 4, false, 1, 8, 15><<<grid, block, 0, stream>>>(xp, wp, ep, out, M, N, K, K, K, basew);
+    else return cudaErrorInvalidValue;
+    return cudaGetLastError();
+}
 
 template <class F, int RT, int MT, int U, bool F32, int WR, int WK>
 static cudaError_t go(cudaLaunchConfig_t* cfg, const Args& a) {
@@ -531,6 +560,14 @@ cudaError_t proj_launch(int fmt, bool f32, const void* x, const void* w, const v
                         int N, int KX, int KW, int g, int rt, int u, int ksplit, uint32_t basew,
                         cudaStream_t stream);
 cudaError_t router_scalar_launch(const void* w, const void* x, void* out, int m, cudaStream_t stream);
+cudaError_t diag_launch(const void* x, const void* w, const void* exc, void* out, int M, int N, int K,
+                        uint32_t basew, int diag, cudaStream_t stream);
+
+void diag(torch::Tensor x, torch::Tensor w, torch::Tensor exc, torch::Tensor out, int64_t basew, int64_t d) {
+    const cudaError_t err = diag_launch(x.data_ptr(), w.data_ptr(), exc.data_ptr(), out.data_ptr(), x.size(0),
+                                        out.size(1), x.size(1), (uint32_t)basew, d, at::cuda::getCurrentCUDAStream());
+    TORCH_CHECK(err == cudaSuccess, "diag: ", cudaGetErrorString(err));
+}
 
 void router_scalar(torch::Tensor x, torch::Tensor w, torch::Tensor out) {
     TORCH_CHECK(x.is_contiguous() && w.is_contiguous() && out.is_contiguous() && x.size(1) == 8192);
@@ -553,6 +590,7 @@ CPP_DECLS = """
 void proj(torch::Tensor x, torch::Tensor w, torch::Tensor exc, torch::Tensor out, int64_t fmt, int64_t kx,
           int64_t kw, int64_t g, int64_t rt, int64_t u, int64_t ksplit, int64_t basew);
 void router_scalar(torch::Tensor x, torch::Tensor w, torch::Tensor out);
+void diag(torch::Tensor x, torch::Tensor w, torch::Tensor exc, torch::Tensor out, int64_t basew, int64_t d);
 """
 
 _MOD = None
@@ -567,7 +605,7 @@ def _cuda():
         try:
             _MOD = load_inline(
                 name="muse_bf16_proj_v5", cpp_sources=CPP_DECLS, cuda_sources=CUDA_KERNELS + CUDA_TORCH,
-                functions=["proj", "router_scalar"], extra_cuda_cflags=["-O3"], verbose=False)
+                functions=["proj", "router_scalar", "diag"], extra_cuda_cflags=["-O3"], verbose=False)
             print(f"CUDA compiled in {time.time() - t0:.0f}s", flush=True)
         except Exception as e:  # noqa: BLE001 - fall back to cuBLAS and say why
             print(f"CUDA compile failed after {time.time() - t0:.0f}s: {str(e)[-3000:]}", flush=True)
@@ -914,6 +952,15 @@ def _sweep(state, budget_s=150.0):
     flush = torch.empty(max(4 * l2, 256 << 20) // 4, device=dev, dtype=torch.float32).fill_(1.0)
     gen = torch.Generator(device=dev).manual_seed(1)
     rows, load_t, probes = [], {}, {}
+    if _MOD and state["c12"].get("pooler") is not None:  # where the 12-bit kernel's time goes
+        x1 = torch.randn((1, 8192), device=dev).to(torch.bfloat16)
+        c, ws = state["c12"]["pooler"], _stream(state, "pooler", 4096, "c12", 1, 4, 1, 0)
+        o1 = torch.empty((1, 4096), device=dev, dtype=torch.bfloat16)
+        res = {"full": _graph_us(lambda: _proj("c12", x1, state, "pooler", 4096, (1, 4, 1, 0)), flush)[0]}
+        for d, name in ((1, "no decode"), (2, "no exceptions"), (4, "no mma"), (8, "no x"), (15, "loads only")):
+            res[name] = _graph_us(lambda: (_MOD.diag(x1, ws, c["exc"], o1, c["basew"], d), o1)[1], flush)[0]
+        print("DIAG pooler m=1 c12[1,4,1,0] net us: " + " ".join(f"{k}={v - FIXED_US:.2f}" for k, v in res.items()),
+              flush=True)
     for m in BUCKETS:
         for layer in LAYER_NAMES:
             w, k_x = _weight(state, layer)
