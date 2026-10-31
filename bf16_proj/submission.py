@@ -257,7 +257,7 @@ __device__ __forceinline__ uint32_t dec_pair(uint32_t s, uint32_t q, uint32_t ba
 // codes, so a warp reads 768 bytes instead of 1024. Values below the code's exponent window
 // decode to a known wrong value; each warp then adds (w_true - w_decoded) * x for the
 // exceptions of its own k slice (list sorted per tile), which makes the product exact.
-template <int RT, int MT, int U>
+template <int RT, int MT, int U, bool DEC = true>  // DEC false: no decode, wrong values (timing probe)
 __global__ void __launch_bounds__(256) c12_mma_kernel(
         const __nv_bfloat16* __restrict__ x, const int4* __restrict__ sm, const int2* __restrict__ ex,
         const int* __restrict__ exc_off, const int2* __restrict__ exc, __nv_bfloat16* __restrict__ out,
@@ -320,10 +320,16 @@ __global__ void __launch_bounds__(256) c12_mma_kernel(
             for (int rt = 0; rt < RT; ++rt) {
                 const int4 s = st.s[u][rt];
                 const uint32_t q0 = st.q[u][rt].x, q1 = st.q[u][rt].y;
-                const int a0 = dec_pair<0>(s.x, q0, basew), a1 = dec_pair<1>(s.x, q0, basew);
-                const int a2 = dec_pair<2>(s.y, q0, basew), a3 = dec_pair<3>(s.y, q0, basew);
-                const int b0 = dec_pair<0>(s.z, q1, basew), b1 = dec_pair<1>(s.z, q1, basew);
-                const int b2 = dec_pair<2>(s.w, q1, basew), b3 = dec_pair<3>(s.w, q1, basew);
+                int a0, a1, a2, a3, b0, b1, b2, b3;
+                if constexpr (DEC) {
+                    a0 = dec_pair<0>(s.x, q0, basew), a1 = dec_pair<1>(s.x, q0, basew);
+                    a2 = dec_pair<2>(s.y, q0, basew), a3 = dec_pair<3>(s.y, q0, basew);
+                    b0 = dec_pair<0>(s.z, q1, basew), b1 = dec_pair<1>(s.z, q1, basew);
+                    b2 = dec_pair<2>(s.w, q1, basew), b3 = dec_pair<3>(s.w, q1, basew);
+                } else {
+                    a0 = s.x ^ q0, a1 = s.x ^ q1, a2 = s.y ^ q0, a3 = s.y ^ q1;
+                    b0 = s.z ^ q0, b1 = s.z ^ q1, b2 = s.w ^ q0, b3 = s.w ^ q1;
+                }
 #pragma unroll
                 for (int nt = 0; nt < MT; ++nt) {
                     mma_bf16(acc[rt][nt], a0, b0, a1, b1, st.xv[u][nt].x, st.xv[u][nt].y);
@@ -458,6 +464,9 @@ cudaError_t c12_mma_launch(const void* x, const void* sm, const void* ex, const 
     const C12Args a{static_cast<const __nv_bfloat16*>(x), static_cast<const int4*>(sm),
                     static_cast<const int2*>(ex), static_cast<const int*>(off), static_cast<const int2*>(exc),
                     static_cast<__nv_bfloat16*>(out), M, N, K, K / ksplit, basew};
+    if (u == 0 && rt == 1 && mt_of(M) == 1)  // timing probe: c12 with the decode left out
+        return cudaLaunchKernelEx(&cfg, c12_mma_kernel<1, 1, 4, false>, a.x, a.sm, a.ex, a.off, a.exc, a.out,
+                                  a.M, a.N, a.K, K / ksplit, basew);
     if (rt == 2) return c12_r<2>(&cfg, mt_of(M), u, a);
     return c12_r<1>(&cfg, mt_of(M), u, a);
 }
@@ -625,11 +634,23 @@ def _torch(x, state, layer, n):
     return _bf16_gemm_dispatch_impl(x, state[layer][:n], None)  # SGLang's own pick: never slower
 
 
+def _mm(kind, x, state, layer, n):
+    """cuBLAS with another weight layout, which makes it pick other kernels. mm_t: a [K, N]
+    copy of W; mm_n: W [N, K] as a transposed view. The router runs as one [x | x] @ [hi | lo]^T."""
+    if layer == "router":
+        w = state["router_hilo_t"] if kind == "mm_t" else state["router_hilo"].t()
+        return torch.mm(torch.cat([x, x], 1), w, out_dtype=torch.float32)
+    w = state["wt"][layer][:, :n] if kind == "mm_t" else state[layer][:n].t()
+    return torch.mm(x, w)
+
+
 def _run(kind, cfg, x, state, layer, n):
     if kind == "c12" and _MOD and state["c12"].get(layer) is not None:
         return _c12_proj(x, state, layer, n, cfg)
     if kind == "cuda" and _MOD:
         return _cuda_proj(x, state, layer, n, cfg)
+    if kind in ("mm_t", "mm_n"):
+        return _mm(kind, x, state, layer, n)
     return _torch(x, state, layer, n)
 
 
@@ -641,6 +662,9 @@ def prepare(weights: Weights):
     state["router_hilo"] = torch.cat([hi, lo], dim=1).contiguous()
     state["router_hi_t"] = hi.t().contiguous()
     state["router_lo_t"] = lo.t().contiguous()
+    state["router_hilo_t"] = state["router_hilo"].t().contiguous()
+    if BENCH or any(kind == "mm_t" for kind, _ in PLAN.values()):
+        state["wt"] = {name: state[name].t().contiguous() for name in ("qkv_gate", "o", "pooler", "unpooler")}
     state["plan"] = dict(PLAN)
     state["packed"] = {name: pack_weight(state[name]) for name in ("qkv_gate", "o", "pooler", "unpooler")}
     state["packed"]["router"] = pack_weight(state["router_hilo"])
@@ -695,7 +719,7 @@ def _graph_us(fn, flush, reps=30):
 
 
 def _variants(state, m, layer, n, k_w):
-    out = [("torch", None)]
+    out = [("torch", None), ("mm_t", None), ("mm_n", None)]
     if PLAN.get((layer, m), ("torch",))[0] != "torch":
         out.append(PLAN[(layer, m)])
     if not _MOD or (m > 32 and layer != "router"):  # token groups lost 3-7x to cuBLAS (check 45fd2ba0)
@@ -725,9 +749,11 @@ def _c12_probe(state, layer, n):
     return x, w[:, cols].T.contiguous(), int(exc.sum())
 
 
-def _c12_exact(state, layer, n, cfg, probe):
+def _c12_exact(state, layer, n, cfg, probe, m):
+    """Bit-exact on the probe, with as many rows as the token tile class of m holds."""
     x, want, _ = probe
-    return all(torch.equal(_c12_proj(x[:m], state, layer, n, cfg), want[:m]) for m in (1, 16, 32))
+    rows = 8 if m <= 8 else 16 if m <= 16 else 32
+    return torch.equal(_c12_proj(x[:rows], state, layer, n, cfg), want[:rows])
 
 
 def _rel(a, b):
@@ -745,6 +771,11 @@ def _sweep(state, budget_s=150.0):
     flush = torch.empty(max(4 * l2, 256 << 20) // 4, device=dev, dtype=torch.float32).fill_(1.0)
     gen = torch.Generator(device=dev).manual_seed(1)
     rows, load_t, probes = [], {}, {}
+    if _MOD and state["c12"].get("pooler") is not None:  # decode cost: same kernel, decode left out
+        x1 = torch.randn((1, 8192), device=dev).to(torch.bfloat16)
+        t = {u: _graph_us(lambda: _c12_proj(x1, state, "pooler", 4096, (1, u, 1)), flush)[0] - FIXED_US
+             for u in (4, 0)}
+        print(f"C12 pooler m=1 (1,4,1): decode {t[4]:.2f} us, no decode {t[0]:.2f} us", flush=True)
     for m in BUCKETS:
         for layer in LAYER_NAMES:
             w, k_x = _weight(state, layer)
@@ -768,7 +799,7 @@ def _sweep(state, budget_s=150.0):
                     if kind == "c12":
                         if (layer, n) not in probes:
                             probes[(layer, n)] = _c12_probe(state, layer, n)
-                        if not _c12_exact(state, layer, n, cfg, probes[(layer, n)]):
+                        if not _c12_exact(state, layer, n, cfg, probes[(layer, n)], m):
                             bad.append(f"{kind}{cfg}:inexact")
                             continue
                     results.append((t, kind, cfg))
@@ -783,7 +814,7 @@ def _sweep(state, budget_s=150.0):
             load_t[m][0] += sgl
             load_t[m][1] += best
             t_torch = next(t for t, k, _ in results if k == "torch") - FIXED_US
-            tag = {"cuda": "c", "c12": "z", "torch": "t"}
+            tag = {"cuda": "c", "c12": "z", "torch": "t", "mm_t": "T", "mm_n": "N"}
             top = " ".join(f"{t - FIXED_US:.2f}{tag[k]}{list(c) if c else ''}" for t, k, c in results[:3])
             rows.append(f"m={m:<3} {layer:<8} sgl={sgl:6.2f} torch={t_torch:6.2f} best={best:6.2f} "
                         f"x{sgl / max(best, 0.05):.2f} | {top}" + (f" | bad {' '.join(bad[:4])}" if bad else ""))
