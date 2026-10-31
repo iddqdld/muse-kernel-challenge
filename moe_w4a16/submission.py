@@ -450,7 +450,7 @@ def prepare(weights: Weights):
         "gs13": weights["w13_gs"].float().contiguous(), "gs2": weights["w2_gs"].float().contiguous(),
         "norm_w": weights["post_norm_w"].contiguous(),  # BF16, as given; kernels use 1 + w
         "meta": torch.zeros(1 + 3 * MAX_GROUPS, device=weights["w13"].device, dtype=torch.int32),
-        "grid": 2 * torch.cuda.get_device_properties(weights["w13"].device).multi_processor_count,
+        "grid": 4 * torch.cuda.get_device_properties(weights["w13"].device).multi_processor_count,
     }
     _cuda()
     return state
