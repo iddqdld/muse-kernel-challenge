@@ -88,18 +88,11 @@ __device__ __forceinline__ void mma_bf16(float* c, uint32_t a0, uint32_t a1, uin
 
 // E4M3 block scale byte -> BF16 (scale * 2^118) in both halves.
 __device__ __forceinline__ uint32_t scale2(uint32_t b) {
-    const uint32_t m = b & 0x7fu, sign = (b & 0x80u) << 8;
-    uint32_t u;
-    if (m >= 8 && m < 127) {
-        u = sign | ((m << 4) + 0x7700u);
-    } else if (m == 127) {
-        u = sign | 0x7fc0u;
-    } else if (m == 0) {
-        u = sign;
-    } else {
-        const int h = 31 - __clz(m);
-        u = sign | ((236 + h) << 7) | (((m << (2 - h)) & 3u) << 5);
-    }
+    uint32_t h2;
+    const unsigned short dup = (unsigned short)(b | (b << 8));
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h2) : "h"(dup));
+    const float f = __half2float(__ushort_as_half((unsigned short)(h2 & 0xffffu))) * 0x1p118f;
+    const uint32_t u = __bfloat16_as_ushort(__float2bfloat16_rn(f));
     return u | (u << 16);
 }
 
@@ -294,6 +287,7 @@ __device__ __forceinline__ void down_item(const __nv_bfloat16* __restrict__ act,
 }
 
 // Persistent: blocks walk the items (group, 16-row tile). 256 threads, 2 blocks per SM.
+template <int MT_CAP>
 __global__ void __launch_bounds__(256, 2) moe_up_kernel(
         const __nv_bfloat16* __restrict__ x, const int* __restrict__ meta, const int* __restrict__ list,
         int local_start, const int4* __restrict__ codes, const int4* __restrict__ scales,
@@ -305,13 +299,21 @@ __global__ void __launch_bounds__(256, 2) moe_up_kernel(
         const int e = meta[META_E + grp], n = meta[META_N + grp];
         const int* routes = list + meta[META_BEG + grp];
         const float gsc = gs[local_start + e] * 256.f;
-        if (n <= 8) up_item<1>(x, routes, n, e, tile, codes, scales, gsc, act, red);
-        else if (n <= 16) up_item<2>(x, routes, n, e, tile, codes, scales, gsc, act, red);
-        else up_item<4>(x, routes, n, e, tile, codes, scales, gsc, act, red);
+        if constexpr (MT_CAP == 1) {
+            up_item<1>(x, routes, n, e, tile, codes, scales, gsc, act, red);
+        } else if constexpr (MT_CAP == 2) {
+            if (n <= 8) up_item<1>(x, routes, n, e, tile, codes, scales, gsc, act, red);
+            else up_item<2>(x, routes, n, e, tile, codes, scales, gsc, act, red);
+        } else {
+            if (n <= 8) up_item<1>(x, routes, n, e, tile, codes, scales, gsc, act, red);
+            else if (n <= 16) up_item<2>(x, routes, n, e, tile, codes, scales, gsc, act, red);
+            else up_item<4>(x, routes, n, e, tile, codes, scales, gsc, act, red);
+        }
     }
 }
 
-// Two resident blocks hide dequant latency, even though the down kernel spills.
+// Two resident blocks hide dequant latency; the MT=4 down kernel may spill.
+template <int MT_CAP>
 __global__ void __launch_bounds__(256, 2) moe_down_kernel(
         const __nv_bfloat16* __restrict__ act, const int* __restrict__ meta, const int* __restrict__ list,
         int local_start, const int4* __restrict__ codes, const int4* __restrict__ scales,
@@ -323,9 +325,16 @@ __global__ void __launch_bounds__(256, 2) moe_down_kernel(
         const int e = meta[META_E + grp], n = meta[META_N + grp];
         const int* routes = list + meta[META_BEG + grp];
         const float gsc = gs[local_start + e] * 256.f;
-        if (n <= 8) down_item<1>(act, routes, n, e, tile, codes, scales, gsc, ybuf, red);
-        else if (n <= 16) down_item<2>(act, routes, n, e, tile, codes, scales, gsc, ybuf, red);
-        else down_item<4>(act, routes, n, e, tile, codes, scales, gsc, ybuf, red);
+        if constexpr (MT_CAP == 1) {
+            down_item<1>(act, routes, n, e, tile, codes, scales, gsc, ybuf, red);
+        } else if constexpr (MT_CAP == 2) {
+            if (n <= 8) down_item<1>(act, routes, n, e, tile, codes, scales, gsc, ybuf, red);
+            else down_item<2>(act, routes, n, e, tile, codes, scales, gsc, ybuf, red);
+        } else {
+            if (n <= 8) down_item<1>(act, routes, n, e, tile, codes, scales, gsc, ybuf, red);
+            else if (n <= 16) down_item<2>(act, routes, n, e, tile, codes, scales, gsc, ybuf, red);
+            else down_item<4>(act, routes, n, e, tile, codes, scales, gsc, ybuf, red);
+        }
     }
 }
 
@@ -397,6 +406,20 @@ __global__ void __launch_bounds__(256) moe_combine_kernel(
     dst[1] = reinterpret_cast<const int4*>(o)[1];
 }
 
+template <int MT_CAP>
+static void launch_up(const __nv_bfloat16* x, const int* meta, const int* list, int local_start,
+                      const int4* codes, const int4* scales, const float* gs, __nv_bfloat16* act,
+                      int grid, cudaStream_t st) {
+    moe_up_kernel<MT_CAP><<<grid, 256, 0, st>>>(x, meta, list, local_start, codes, scales, gs, act);
+}
+
+template <int MT_CAP>
+static void launch_down(const __nv_bfloat16* act, const int* meta, const int* list, int local_start,
+                        const int4* codes, const int4* scales, const float* gs, __nv_bfloat16* ybuf,
+                        int grid, cudaStream_t st) {
+    moe_down_kernel<MT_CAP><<<grid, 256, 0, st>>>(act, meta, list, local_start, codes, scales, gs, ybuf);
+}
+
 cudaError_t moe_launch(const void* x, const int* ids, const float* wts, int M, int local_start,
                        const void* c13, const void* s13, const float* gs13, const void* c2, const void* s2,
                        const float* gs2, const void* norm_w, void* act, void* ybuf, int* meta,
@@ -404,10 +427,23 @@ cudaError_t moe_launch(const void* x, const int* ids, const float* wts, int M, i
     const int n_ids = M * TOPK;
     if (n_ids > 32 * MAX_GROUPS - 32 * LOCAL) return cudaErrorInvalidValue;  // groups always fit
     moe_route_kernel<<<1, 1024, 0, st>>>(ids, n_ids, local_start, meta, list);
-    moe_up_kernel<<<grid, 256, 0, st>>>((const __nv_bfloat16*)x, meta, list, local_start, (const int4*)c13,
-                                        (const int4*)s13, gs13, (__nv_bfloat16*)act);
-    moe_down_kernel<<<grid, 256, 0, st>>>((const __nv_bfloat16*)act, meta, list, local_start, (const int4*)c2,
-                                          (const int4*)s2, gs2, (__nv_bfloat16*)ybuf);
+    // Each token visits an expert at most once, so M<=8 needs MT=1 and M<=16 needs at most MT=2.
+    if (M <= 8) {
+        launch_up<1>((const __nv_bfloat16*)x, meta, list, local_start, (const int4*)c13, (const int4*)s13,
+                     gs13, (__nv_bfloat16*)act, grid, st);
+        launch_down<1>((const __nv_bfloat16*)act, meta, list, local_start, (const int4*)c2, (const int4*)s2,
+                       gs2, (__nv_bfloat16*)ybuf, grid, st);
+    } else if (M <= 16) {
+        launch_up<2>((const __nv_bfloat16*)x, meta, list, local_start, (const int4*)c13, (const int4*)s13,
+                     gs13, (__nv_bfloat16*)act, grid, st);
+        launch_down<2>((const __nv_bfloat16*)act, meta, list, local_start, (const int4*)c2, (const int4*)s2,
+                       gs2, (__nv_bfloat16*)ybuf, grid, st);
+    } else {
+        launch_up<4>((const __nv_bfloat16*)x, meta, list, local_start, (const int4*)c13, (const int4*)s13,
+                     gs13, (__nv_bfloat16*)act, grid, st);
+        launch_down<4>((const __nv_bfloat16*)act, meta, list, local_start, (const int4*)c2, (const int4*)s2,
+                       gs2, (__nv_bfloat16*)ybuf, grid, st);
+    }
     moe_combine_kernel<<<M, 256, 0, st>>>(ids, wts, local_start, (const __nv_bfloat16*)norm_w,
                                           (const __nv_bfloat16*)ybuf, (__nv_bfloat16*)out);
     return cudaGetLastError();
