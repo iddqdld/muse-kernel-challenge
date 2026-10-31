@@ -31,7 +31,7 @@ from typing import TypedDict
 import torch
 import torch.nn.functional as F
 
-BENCH = True
+BENCH = False
 
 
 class Weights(TypedDict):
@@ -631,6 +631,142 @@ void router_scalar(torch::Tensor x, torch::Tensor w, torch::Tensor out);
 void diag(torch::Tensor x, torch::Tensor w, torch::Tensor exc, torch::Tensor out, int64_t basew, int64_t d);
 """
 
+# cuBLASLt with a fixed algorithm, for the m >= 128 shapes (a separate module: if it does not build,
+# only the "lt" variants are lost). An algorithm is 9 ints: ID, TILE_ID, SPLITK_NUM, REDUCTION_SCHEME,
+# CTA_SWIZZLING, CUSTOM_OPTION, STAGES_ID, INNER_SHAPE_ID, CLUSTER_SHAPE_ID. Layouts of out = x @ W^T:
+# 0: W [N, K] as A (transposed), x as B, column-major; 2: W^T [K, N] as A, x as B, column-major;
+# 3: row-major x [M, K] @ W^T [K, N]. BF16 in and out, FP32 accumulation.
+LT_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cublasLt.h>
+#include <vector>
+
+static cublasLtHandle_t lt_handle() {
+    static cublasLtHandle_t h = nullptr;
+    if (!h) TORCH_CHECK(cublasLtCreate(&h) == CUBLAS_STATUS_SUCCESS, "cublasLtCreate");
+    return h;
+}
+
+struct LtMats {
+    cublasLtMatmulDesc_t op = nullptr;
+    cublasLtMatrixLayout_t a = nullptr, b = nullptr, d = nullptr;
+    LtMats(int layout, int64_t m, int64_t n, int64_t k) {
+        cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+        const cublasOperation_t ta = layout == 0 ? CUBLAS_OP_T : CUBLAS_OP_N, tb = CUBLAS_OP_N;
+        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta));
+        cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb));
+        if (layout == 3) {
+            cublasLtMatrixLayoutCreate(&a, CUDA_R_16BF, m, k, k);
+            cublasLtMatrixLayoutCreate(&b, CUDA_R_16BF, k, n, n);
+            cublasLtMatrixLayoutCreate(&d, CUDA_R_16BF, m, n, n);
+            const cublasLtOrder_t row = CUBLASLT_ORDER_ROW;
+            for (auto l : {a, b, d}) cublasLtMatrixLayoutSetAttribute(l, CUBLASLT_MATRIX_LAYOUT_ORDER, &row, sizeof(row));
+        } else {
+            if (layout == 0) cublasLtMatrixLayoutCreate(&a, CUDA_R_16BF, k, n, k);
+            else cublasLtMatrixLayoutCreate(&a, CUDA_R_16BF, n, k, n);
+            cublasLtMatrixLayoutCreate(&b, CUDA_R_16BF, k, m, k);
+            cublasLtMatrixLayoutCreate(&d, CUDA_R_16BF, n, m, n);
+        }
+    }
+    ~LtMats() {
+        if (d) cublasLtMatrixLayoutDestroy(d);
+        if (b) cublasLtMatrixLayoutDestroy(b);
+        if (a) cublasLtMatrixLayoutDestroy(a);
+        if (op) cublasLtMatmulDescDestroy(op);
+    }
+};
+
+static const cublasLtMatmulAlgoConfigAttributes_t LT_ATTR[9] = {
+    CUBLASLT_ALGO_CONFIG_ID, CUBLASLT_ALGO_CONFIG_TILE_ID, CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+    CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING, CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION,
+    CUBLASLT_ALGO_CONFIG_STAGES_ID, CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID, CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID};
+
+// x [M, K]; w = W [N, K] (layout 0) or W^T [K, N] (2, 3); out [M, N]; cfg: the 9 algorithm ints.
+void lt_run(torch::Tensor x, torch::Tensor w, torch::Tensor out, int64_t layout, std::vector<int64_t> cfg,
+            torch::Tensor ws) {
+    const int64_t m = x.size(0), k = x.size(1), n = out.size(1);
+    TORCH_CHECK(cfg.size() == 9 && x.is_contiguous() && w.is_contiguous() && out.is_contiguous());
+    LtMats L((int)layout, m, n, k);
+    cublasLtMatmulAlgo_t algo;
+    TORCH_CHECK(cublasLtMatmulAlgoInit(lt_handle(), CUBLAS_COMPUTE_32F, CUDA_R_32F, CUDA_R_16BF, CUDA_R_16BF,
+                                       CUDA_R_16BF, CUDA_R_16BF, (int)cfg[0], &algo) == CUBLAS_STATUS_SUCCESS,
+                "lt: algo init");
+    for (int i = 1; i < 9; ++i) {
+        const uint32_t v32 = (uint32_t)cfg[i];
+        const uint16_t v16 = (uint16_t)cfg[i];
+        const bool small = i >= 7;  // INNER_SHAPE_ID and CLUSTER_SHAPE_ID are uint16
+        TORCH_CHECK(cublasLtMatmulAlgoConfigSetAttribute(&algo, LT_ATTR[i], small ? (const void*)&v16 : (const void*)&v32,
+                                                         small ? 2 : 4) == CUBLAS_STATUS_SUCCESS, "lt: config ", i);
+    }
+    const float alpha = 1.f, beta = 0.f;
+    const void* A = layout == 3 ? x.data_ptr() : w.data_ptr();
+    const void* B = layout == 3 ? w.data_ptr() : x.data_ptr();
+    const cublasStatus_t st = cublasLtMatmul(lt_handle(), L.op, &alpha, A, L.a, B, L.b, &beta, out.data_ptr(), L.d,
+                                             out.data_ptr(), L.d, &algo, ws.data_ptr(), ws.numel(),
+                                             at::cuda::getCurrentCUDAStream());
+    TORCH_CHECK(st == CUBLAS_STATUS_SUCCESS, "lt: matmul status ", (int)st);
+}
+
+// The heuristic's first `count` algorithms for this problem, 9 ints each (flattened).
+std::vector<int64_t> lt_algos(torch::Tensor x, torch::Tensor w, torch::Tensor out, int64_t layout, torch::Tensor ws,
+                              int64_t count) {
+    const int64_t m = x.size(0), k = x.size(1), n = out.size(1);
+    LtMats L((int)layout, m, n, k);
+    cublasLtMatmulPreference_t pref;
+    cublasLtMatmulPreferenceCreate(&pref);
+    const uint64_t bytes = ws.numel();
+    cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &bytes, sizeof(bytes));
+    std::vector<cublasLtMatmulHeuristicResult_t> res(count);
+    int got = 0;
+    cublasLtMatmulAlgoGetHeuristic(lt_handle(), L.op, L.a, L.b, L.d, L.d, pref, (int)count, res.data(), &got);
+    cublasLtMatmulPreferenceDestroy(pref);
+    std::vector<int64_t> flat;
+    for (int r = 0; r < got; ++r) {
+        if (res[r].state != CUBLAS_STATUS_SUCCESS) continue;
+        for (int i = 0; i < 9; ++i) {
+            uint32_t v32 = 0;
+            uint16_t v16 = 0;
+            size_t written = 0;
+            const bool small = i >= 7;
+            cublasLtMatmulAlgoConfigGetAttribute(&res[r].algo, LT_ATTR[i], small ? (void*)&v16 : (void*)&v32,
+                                                 small ? 2 : 4, &written);
+            flat.push_back(small ? v16 : (int64_t)(i == 0 ? (int32_t)v32 : v32));
+        }
+    }
+    return flat;
+}
+"""
+
+# Seeds from the public v18 entry's offline search (github.com/NathenFernandes/muse-bf16-proj):
+# (layer, m) -> (layout, 9 algorithm ints). Candidates only: the sweep times them with the rest.
+LT_SEEDS = {
+    ("pooler", 128): [(2, 66, 15, 1, 0, 0, 4, 35, 0, 2)],
+    ("pooler", 256): [(3, 66, 18, 1, 0, 0, 0, 35, 0, 2)],
+    ("unpooler", 128): [(2, 66, 18, 1, 0, 0, 3, 35, 0, 5)],
+    ("unpooler", 256): [(3, 66, 20, 1, 0, 0, 4, 35, 0, 2)],
+    ("qkv_gate", 256): [(0, 66, 124, 1, 0, 0, 0, 35, 0, 2)],
+}
+_LT = None
+
+
+def _lt_mod():
+    """Build the cuBLASLt module once; None if that fails (the "lt" variants are then skipped)."""
+    global _LT
+    if _LT is None:
+        from torch.utils.cpp_extension import load_inline
+        t0 = time.time()
+        try:
+            _LT = load_inline(name="muse_bf16_lt_v1", cpp_sources=LT_SRC, functions=["lt_run", "lt_algos"],
+                              with_cuda=True, extra_cflags=["-O3"], extra_ldflags=["-l:libcublasLt.so.13"],
+                              verbose=False)
+            print(f"cuBLASLt module built in {time.time() - t0:.0f}s", flush=True)
+        except Exception as e:  # noqa: BLE001 - lose only the "lt" variants, and say why
+            print(f"cuBLASLt build failed after {time.time() - t0:.0f}s: {str(e)[-2000:]}", flush=True)
+            _LT = False
+    return _LT or None
+
+
 _MOD = None
 
 
@@ -657,31 +793,28 @@ LAYER_NAMES = ("qkv_gate", "o", "pooler", "unpooler", "router")
 # (layer, bucket) -> (kind, (rt, u, ksplit)) with kind "cuda" (Plain format), "c12" or "c12w"
 # (12-bit code); ("mm_t" | "mm_n", None) for cuBLAS on another weight layout; ("torch", None)
 # for SGLang's own dispatch. Filled from BENCH runs.
-PLAN = {  # check cabd7c81: our kernels where they beat SGLang by more than 2%
+PLAN = {  # check cf2656aa: our kernels where they beat SGLang by more than 2%
     **{(layer, m): ("torch", None) for layer in LAYER_NAMES for m in BUCKETS},
-    ("qkv_gate", 1): ("cuda", (1, 2, 1, 2)),
-    ("qkv_gate", 8): ("c12", (1, 4, 1, 1)),
-    ("qkv_gate", 16): ("c12", (2, 4, 1, 0)),
-    ("qkv_gate", 32): ("mm_t", None),
-    ("o", 1): ("c12w", (2, 2, 1, 0)),
+    ("qkv_gate", 1): ("c12", (2, 2, 4, 6)),
+    ("qkv_gate", 8): ("c12", (2, 2, 4, 6)),
+    ("qkv_gate", 16): ("cuda", (1, 2, 4, 6)),
+    ("o", 1): ("c12", (2, 2, 1, 0)),
     ("o", 8): ("c12w", (2, 2, 1, 0)),
-    ("o", 32): ("mm_t", None),
-    ("o", 128): ("mm_t", None),
     ("pooler", 1): ("c12", (1, 4, 1, 1)),
-    ("pooler", 8): ("c12w", (1, 4, 1, 0)),
+    ("pooler", 8): ("c12", (1, 4, 1, 1)),
     ("pooler", 16): ("c12", (2, 4, 1, 0)),
     ("pooler", 32): ("c12", (2, 2, 1, 0)),
     ("pooler", 128): ("mm_t", None),
     ("pooler", 256): ("mm_t", None),
     ("unpooler", 1): ("cuda", (1, 8, 1, 0)),
     ("unpooler", 8): ("cuda", (1, 8, 1, 0)),
-    ("unpooler", 16): ("c12w", (2, 2, 1, 0)),
+    ("unpooler", 16): ("c12", (2, 4, 1, 5)),
     ("unpooler", 32): ("mm_t", None),
     ("unpooler", 128): ("mm_t", None),
     ("router", 1): ("rs", None),
-    ("router", 8): ("cuda", (1, 4, 8, 0)),
-    ("router", 16): ("cuda", (1, 2, 8, 4)),
-    ("router", 32): ("cuda", (2, 2, 8, 0)),
+    ("router", 8): ("cuda", (1, 8, 4, 7)),
+    ("router", 16): ("cuda", (2, 4, 8, 0)),
+    ("router", 32): ("cuda", (1, 2, 16, 5)),
     ("router", 128): ("mm_st", None),
     ("router", 256): ("mm_st", None),
 }
@@ -867,6 +1000,25 @@ def _mm(kind, x, state, layer, n):
     return torch.mm(x, w)
 
 
+def _lt(x, state, layer, n, cfg):
+    """cuBLASLt with a fixed algorithm; cfg = (layout, 9 algorithm ints), see LT_SRC."""
+    out = _out(x, layer, n)
+    w = state[layer] if cfg[0] == 0 else state["wt"][layer]
+    _lt_mod().lt_run(x, w, out, cfg[0], list(cfg[1:]), state["lt_ws"])
+    return out
+
+
+def _lt_variants(state, layer, m, n):
+    """The heuristic's first 16 algorithms for each layout, plus the seeds for (layer, m)."""
+    x = torch.zeros((m, state[layer].shape[1]), device=state[layer].device, dtype=torch.bfloat16)
+    out, found = _out(x, layer, n), []
+    for layout in (0, 2, 3):
+        w = state[layer] if layout == 0 else state["wt"][layer]
+        flat = _lt_mod().lt_algos(x, w, out, layout, state["lt_ws"], 16)
+        found += [(layout, *flat[i:i + 9]) for i in range(0, len(flat), 9)]
+    return [("lt", c) for c in dict.fromkeys(found + LT_SEEDS.get((layer, m), []))]
+
+
 def _run(kind, cfg, x, state, layer, n):
     if kind in ("cuda", "c12", "c12w") and _MOD:
         if not kind.startswith("c12") or state["c12"].get(layer) is not None:
@@ -875,6 +1027,8 @@ def _run(kind, cfg, x, state, layer, n):
         out = _out(x, layer, n)
         _MOD.router_scalar(x, state["router"], out)
         return out
+    if kind == "lt" and _lt_mod():
+        return _lt(x, state, layer, n, cfg)
     if kind in ("mm_t", "mm_n", "mm_s", "mm_st"):
         return _mm(kind, x, state, layer, n)
     return _torch(x, state, layer, n)
@@ -891,8 +1045,10 @@ def prepare(weights: Weights):
     state["router_hilo_t"] = state["router_hilo"].t().contiguous()
     state["router_hl"] = torch.cat([hi, lo], dim=0).contiguous()  # [512, 8192]: hi rows, then lo rows
     state["router_hl_t"] = state["router_hl"].t().contiguous()
-    if BENCH or any(kind == "mm_t" for kind, _ in PLAN.values()):
+    if BENCH or any(kind in ("mm_t", "lt") for kind, _ in PLAN.values()):
         state["wt"] = {name: state[name].t().contiguous() for name in ("qkv_gate", "o", "pooler", "unpooler")}
+    if BENCH or any(kind == "lt" for kind, _ in PLAN.values()):
+        state["lt_ws"] = torch.empty(32 << 20, device=dev, dtype=torch.uint8)  # cuBLASLt workspace
     state["plan"] = dict(PLAN)
     state["units"] = {name: pack_weight(state[name]) for name in ("qkv_gate", "o", "pooler", "unpooler")}
     state["units"]["router"] = pack_weight(state["router_hilo"])
@@ -909,6 +1065,17 @@ def prepare(weights: Weights):
                 _stream(state, layer, n, "cuda", *cfg)
     if BENCH or any(kind != "torch" for kind, _ in PLAN.values()):
         _cuda()
+    if BENCH or any(kind == "lt" for kind, _ in PLAN.values()):
+        _lt_mod()
+    for (layer, m), (kind, cfg) in list(state["plan"].items()):  # a planned cuBLASLt algorithm must run here
+        if kind == "lt":
+            try:
+                _lt(torch.zeros((m, state[layer].shape[1]), device=dev, dtype=torch.bfloat16), state, layer,
+                    state[layer].shape[0], cfg)
+                torch.cuda.synchronize()
+            except Exception as e:  # noqa: BLE001 - fall back to SGLang's dispatch, and say why
+                print(f"cuBLASLt {layer} m={m} {cfg} unusable: {str(e)[:200]}", flush=True)
+                state["plan"][(layer, m)] = ("torch", None)
     if BENCH:
         _env_report()
         _sweep(state)
@@ -962,6 +1129,8 @@ def _variants(state, m, layer, n, k_w):
         out += [("mm_s", None), ("mm_st", None)] + ([("rs", None)] if m <= 8 else [])
     if PLAN.get((layer, m), ("torch",))[0] != "torch":
         out.append(PLAN[(layer, m)])
+    if m >= 128 and layer != "router" and _lt_mod():
+        out += _lt_variants(state, layer, m, n)
     if not _MOD or (m > 32 and layer != "router"):  # token groups lost 3-7x to cuBLAS (check 45fd2ba0)
         return out
     has_c12 = state["c12"].get(layer) is not None
@@ -1068,7 +1237,7 @@ def _sweep(state, budget_s=150.0):
             load_t[m][1] += best
             t_torch = next(t for t, k, _ in results if k == "torch") - FIXED_US
             tag = {"cuda": "c", "c12": "z", "c12w": "w", "torch": "t", "mm_t": "T", "mm_n": "N", "mm_s": "S",
-                   "mm_st": "U", "rs": "R"}
+                   "mm_st": "U", "rs": "R", "lt": "L"}
             top = " ".join(f"{t - FIXED_US:.2f}{tag[k]}{list(c) if c else ''}" for t, k, c in results[:3])
             rows.append(f"m={m:<3} {layer:<8} sgl={sgl:6.2f} torch={t_torch:6.2f} best={best:6.2f} "
                         f"x{sgl / max(best, 0.05):.2f} | {top}" + (f" | bad {' '.join(bad[:4])}" if bad else ""))
