@@ -107,20 +107,29 @@ __device__ __forceinline__ uint32_t deq(uint32_t q, uint32_t s) {
     return *reinterpret_cast<const uint32_t*>(&v);
 }
 
-// Four K steps of one chunk: c holds row g in x/y and row g + 8 in z/w.
-__device__ __forceinline__ void dequant_chunk(const int4 c, uint32_t s_lo, uint32_t s_hi, uint32_t (&A)[4][4]) {
-    const uint32_t x = c.x, y = c.y, z = c.z, w = c.w;
-    A[0][0] = deq<0>(x, s_lo); A[0][1] = deq<0>(z, s_hi); A[0][2] = deq<1>(x, s_lo); A[0][3] = deq<1>(z, s_hi);
-    A[1][0] = deq<2>(x, s_lo); A[1][1] = deq<2>(z, s_hi); A[1][2] = deq<3>(x, s_lo); A[1][3] = deq<3>(z, s_hi);
-    A[2][0] = deq<0>(y, s_lo); A[2][1] = deq<0>(w, s_hi); A[2][2] = deq<1>(y, s_lo); A[2][3] = deq<1>(w, s_hi);
-    A[3][0] = deq<2>(y, s_lo); A[3][1] = deq<2>(w, s_hi); A[3][2] = deq<3>(y, s_lo); A[3][3] = deq<3>(w, s_hi);
+// Split each packed chunk into two pairs of K steps to shorten dequant fragment lifetimes.
+__device__ __forceinline__ void dequant_lo(const int4 c, uint32_t s_lo, uint32_t s_hi, uint32_t (&A)[2][4]) {
+    A[0][0] = deq<0>(c.x, s_lo); A[0][1] = deq<0>(c.z, s_hi);
+    A[0][2] = deq<1>(c.x, s_lo); A[0][3] = deq<1>(c.z, s_hi);
+    A[1][0] = deq<2>(c.x, s_lo); A[1][1] = deq<2>(c.z, s_hi);
+    A[1][2] = deq<3>(c.x, s_lo); A[1][3] = deq<3>(c.z, s_hi);
 }
 
-__device__ __forceinline__ void mma_chunk(float (&acc)[4], const uint32_t (&A)[4][4], const int4 b01, const int4 b23) {
+__device__ __forceinline__ void dequant_hi(const int4 c, uint32_t s_lo, uint32_t s_hi, uint32_t (&A)[2][4]) {
+    A[0][0] = deq<0>(c.y, s_lo); A[0][1] = deq<0>(c.w, s_hi);
+    A[0][2] = deq<1>(c.y, s_lo); A[0][3] = deq<1>(c.w, s_hi);
+    A[1][0] = deq<2>(c.y, s_lo); A[1][1] = deq<2>(c.w, s_hi);
+    A[1][2] = deq<3>(c.y, s_lo); A[1][3] = deq<3>(c.w, s_hi);
+}
+
+__device__ __forceinline__ void mma_lo(float (&acc)[4], const uint32_t (&A)[2][4], const int4 b01) {
     mma_bf16(acc, A[0][0], A[0][1], A[0][2], A[0][3], b01.x, b01.y);
     mma_bf16(acc, A[1][0], A[1][1], A[1][2], A[1][3], b01.z, b01.w);
-    mma_bf16(acc, A[2][0], A[2][1], A[2][2], A[2][3], b23.x, b23.y);
-    mma_bf16(acc, A[3][0], A[3][1], A[3][2], A[3][3], b23.z, b23.w);
+}
+
+__device__ __forceinline__ void mma_hi(float (&acc)[4], const uint32_t (&A)[2][4], const int4 b23) {
+    mma_bf16(acc, A[0][0], A[0][1], A[0][2], A[0][3], b23.x, b23.y);
+    mma_bf16(acc, A[1][0], A[1][1], A[1][2], A[1][3], b23.z, b23.w);
 }
 
 // meta (int32): [0] number of groups; then per group (at most MAX_GROUPS): local expert, first
@@ -160,7 +169,7 @@ __global__ void __launch_bounds__(1024) moe_route_kernel(const int* __restrict__
     }
 }
 
-// Each warp prefetches packed weights, then consumes four K steps per activation-row pair.
+// Each warp prefetches all packed weight chunks, then dequantizes and consumes each half in order.
 template <int MT, int NCHUNK>
 __device__ __forceinline__ void warp_tile(const int4* __restrict__ cp, const int4* __restrict__ sp,
                                           const __nv_bfloat16* const (&brow)[MT], float (&acc)[MT][4]) {
@@ -172,12 +181,20 @@ __device__ __forceinline__ void warp_tile(const int4* __restrict__ cp, const int
 #pragma unroll
     for (int u = 0; u < NCHUNK; ++u) {
         const uint32_t sw = reinterpret_cast<const uint32_t*>(&s[u / U])[(u % U) >> 1] >> ((u & 1) * 16);
-        uint32_t A[4][4];
-        dequant_chunk(w[u], scale2(sw & 0xffu), scale2((sw >> 8) & 0xffu), A);
+        const uint32_t s_lo = scale2(sw & 0xffu), s_hi = scale2((sw >> 8) & 0xffu);
+        {
+            uint32_t A[2][4];
+            dequant_lo(w[u], s_lo, s_hi, A);
 #pragma unroll
-        for (int nt = 0; nt < MT; ++nt) {
-            const int4* p = reinterpret_cast<const int4*>(brow[nt] + u * 64);
-            mma_chunk(acc[nt], A, __ldg(p), __ldg(p + 1));
+            for (int nt = 0; nt < MT; ++nt)
+                mma_lo(acc[nt], A, __ldg(reinterpret_cast<const int4*>(brow[nt] + u * 64)));
+        }
+        {
+            uint32_t A[2][4];
+            dequant_hi(w[u], s_lo, s_hi, A);
+#pragma unroll
+            for (int nt = 0; nt < MT; ++nt)
+                mma_hi(acc[nt], A, __ldg(reinterpret_cast<const int4*>(brow[nt] + u * 64) + 1));
         }
     }
 }
