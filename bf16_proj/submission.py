@@ -31,7 +31,7 @@ from typing import TypedDict
 import torch
 import torch.nn.functional as F
 
-BENCH = False
+BENCH = True
 
 
 class Weights(TypedDict):
@@ -1136,7 +1136,7 @@ def _variants(state, m, layer, n, k_w):
         out += [("mm_s", None), ("mm_st", None)] + ([("rs", None)] if m <= 8 else [])
     if PLAN.get((layer, m), ("torch",))[0] != "torch":
         out.append(PLAN[(layer, m)])
-    if m >= 128 and layer != "router" and _lt_mod():
+    if m >= 32 and layer != "router" and _lt_mod():
         out += _lt_variants(state, layer, m, n)
     if not _MOD or (m > 32 and layer != "router"):  # token groups lost 3-7x to cuBLAS (check 45fd2ba0)
         return out
