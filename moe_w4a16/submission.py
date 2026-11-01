@@ -11,10 +11,6 @@ combine (one 256-thread block per token): out = sum over its local routes of
   weight * yn * rsqrt(mean(yn^2) + eps), yn = y * (1 + post_norm_w). For each route the block
   sums yn^2 over all H columns itself, so no other kernel writes per-route sums.
 
-The up and combine kernels run with programmatic dependent launch (PDL): each starts while the
-kernel before it finishes, and waits (griddepcontrol.wait) only before it reads that kernel's
-output, through L2 loads (a read-only-cache load of data a running kernel writes can be stale).
-
 Weights are repacked once in prepare(), losslessly (still E2M1 codes and E4M3 block scales):
 - per 16-row tile, 64-wide k chunk and lane (g = lane / 4, t = lane % 4), one int4 holds the
   16 codes of row g and of row g + 8 at k = 16t .. 16t + 15. Those are exactly the lane's mma
@@ -136,10 +132,6 @@ __device__ __forceinline__ void mma_hi(float (&acc)[4], const uint32_t (&A)[2][4
     mma_bf16(acc, A[1][0], A[1][1], A[1][2], A[1][3], b23.z, b23.w);
 }
 
-// Programmatic dependent launch (PDL). Without the launch attribute both are no-ops.
-__device__ __forceinline__ void grid_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
-__device__ __forceinline__ void grid_launch_dependents() { asm volatile("griddepcontrol.launch_dependents;" ::: "memory"); }
-
 // meta (int32): [0] number of groups; then per group (at most MAX_GROUPS): local expert, first
 // position in the route list, route count (at most 32). A group is one pass of an expert.
 constexpr int MAX_GROUPS = 160;
@@ -150,7 +142,6 @@ constexpr int META_E = 1, META_BEG = 1 + MAX_GROUPS, META_N = 1 + 2 * MAX_GROUPS
 __global__ void __launch_bounds__(1024) moe_route_kernel(const int* __restrict__ ids, int n_ids, int local_start,
                                                          int* __restrict__ meta, int* __restrict__ list) {
     __shared__ int cnt[LOCAL], cur[LOCAL];
-    grid_launch_dependents();  // up blocks take the other SMs now and wait for meta
     if (threadIdx.x < LOCAL) cnt[threadIdx.x] = 0;
     __syncthreads();
     for (int i = threadIdx.x; i < n_ids; i += blockDim.x) {
@@ -178,9 +169,7 @@ __global__ void __launch_bounds__(1024) moe_route_kernel(const int* __restrict__
     }
 }
 
-// Each warp issues all of its packed weight loads, then dequantizes and consumes them in order.
-// The activation fragments go through the read-only cache: no kernel that is still running
-// writes them (the down kernel is not launched with PDL, so the up kernel has ended).
+// Each warp prefetches all packed weight chunks, then dequantizes and consumes each half in order.
 template <int MT, int NCHUNK>
 __device__ __forceinline__ void warp_tile(const int4* __restrict__ cp, const int4* __restrict__ sp,
                                           const __nv_bfloat16* const (&brow)[MT], float (&acc)[MT][4]) {
@@ -226,23 +215,25 @@ __device__ __forceinline__ void elem(int e, int& i, int& row) {
     row = (ln >> 2) + (j >= 2 ? 8 : 0);
 }
 
-// Up item = gate and up tile `tile` of local expert e for the routes routes[0..n): warps 0-3 take
-// the gate rows, warps 4-7 the up rows, each warp a quarter of K. SwiGLU -> act[route].
-// Padded rows read the group's first route; the epilogue discards their accumulators.
+// Gate and up tile `tile` of local expert e for the routes routes[0..n): warps 0-3 take the gate
+// rows, warps 4-7 the up rows, each warp a quarter of K. SwiGLU -> act[route].
 template <int MT>
-__device__ __forceinline__ void up_rows(const __nv_bfloat16* __restrict__ x, const int* routes, int n,
-                                        const __nv_bfloat16* (&brow)[MT]) {
+__device__ __forceinline__ void up_item(const __nv_bfloat16* __restrict__ x, const int* __restrict__ routes, int n,
+                                        int e, int tile, const int4* __restrict__ codes,
+                                        const int4* __restrict__ scales, float gsc, __nv_bfloat16* __restrict__ act,
+                                        float* red) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3, q = warp & 3;
+    const size_t tb = (size_t)e * (2 * I / 16) + tile + (warp >= 4 ? I / 16 : 0);
+    const __nv_bfloat16* brow[MT];
+    // Padded rows read the group's first route; the epilogue discards their accumulators.
 #pragma unroll
     for (int nt = 0; nt < MT; ++nt) {
         const int i = nt * 8 + g;
-        brow[nt] = x + (size_t)(__ldcg(routes + (i < n ? i : 0)) / TOPK) * H + q * (H / 4) + t * 16;
+        brow[nt] = x + (size_t)(routes[i < n ? i : 0] / TOPK) * H + q * (H / 4) + t * 16;
     }
-}
-
-template <int MT>
-__device__ __forceinline__ void up_finish(const float (&acc)[MT][4], const int* routes, int n, int tile, float gsc,
-                                          __nv_bfloat16* __restrict__ act, float* red) {
+    float acc[MT][4] = {};
+    warp_tile<MT, NCH / 4>(codes + (tb * NCH + q * (NCH / 4)) * 32 + lane,
+                           scales + (tb * (NCH / U) + q * (NCH / 4 / U)) * 32 + lane, brow, acc);
     store_partial<MT>(red, acc);
     __syncthreads();
     for (int e2 = threadIdx.x; e2 < MT * 128; e2 += blockDim.x) {
@@ -258,29 +249,30 @@ __device__ __forceinline__ void up_finish(const float (&acc)[MT][4], const int* 
             // SGLang keeps the GEMM outputs (gate, up) in BF16 before silu_and_mul.
             gate = __bfloat162float(__float2bfloat16_rn(gate * gsc));
             up = __bfloat162float(__float2bfloat16_rn(up * gsc));
-            act[(size_t)__ldcg(routes + i) * I + tile * 16 + row] =
-                __float2bfloat16_rn(gate / (1.f + __expf(-gate)) * up);
+            act[(size_t)routes[i] * I + tile * 16 + row] = __float2bfloat16_rn(gate / (1.f + __expf(-gate)) * up);
         }
     }
     __syncthreads();
 }
 
-// Down item = tile `tile` of W2 of local expert e: 8 warps, each an eighth of K. y -> ybuf[route]
-// in BF16 (as SGLang keeps it). The combine kernel sums the squares of y * (1 + w).
+// Down tile `tile` of local expert e: 8 warps, each an eighth of K. y -> ybuf[route] in BF16 (as
+// SGLang keeps it). The combine kernel sums the squares of y * (1 + w).
 template <int MT>
-__device__ __forceinline__ void down_rows(const __nv_bfloat16* __restrict__ act, const int* routes, int n,
-                                          const __nv_bfloat16* (&brow)[MT]) {
+__device__ __forceinline__ void down_item(const __nv_bfloat16* __restrict__ act, const int* __restrict__ routes, int n,
+                                          int e, int tile, const int4* __restrict__ codes,
+                                          const int4* __restrict__ scales, float gsc,
+                                          __nv_bfloat16* __restrict__ ybuf, float* red) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const size_t tb = (size_t)e * (H / 16) + tile;
+    const __nv_bfloat16* brow[MT];
 #pragma unroll
     for (int nt = 0; nt < MT; ++nt) {
         const int i = nt * 8 + g;
-        brow[nt] = act + (size_t)__ldcg(routes + (i < n ? i : 0)) * I + warp * (I / 8) + t * 16;
+        brow[nt] = act + (size_t)routes[i < n ? i : 0] * I + warp * (I / 8) + t * 16;
     }
-}
-
-template <int MT>
-__device__ __forceinline__ void down_finish(const float (&acc)[MT][4], const int* routes, int n, int tile,
-                                            float gsc, __nv_bfloat16* __restrict__ ybuf, float* red) {
+    float acc[MT][4] = {};
+    warp_tile<MT, NCH / 8>(codes + (tb * NCH + warp * (NCH / 8)) * 32 + lane,
+                           scales + (tb * (NCH / U) + warp) * 32 + lane, brow, acc);
     store_partial<MT>(red, acc);
     __syncthreads();
     for (int e2 = threadIdx.x; e2 < MT * 128; e2 += blockDim.x) {
@@ -289,110 +281,60 @@ __device__ __forceinline__ void down_finish(const float (&acc)[MT][4], const int
         for (int w = 0; w < 8; ++w) y += red[w * MT * 128 + e2];
         int i, row;
         elem(e2, i, row);
-        if (i < n) ybuf[(size_t)__ldcg(routes + i) * H + tile * 16 + row] = __float2bfloat16_rn(y * gsc);
+        if (i < n) ybuf[(size_t)routes[i] * H + tile * 16 + row] = __float2bfloat16_rn(y * gsc);
     }
     __syncthreads();
 }
 
-// Weight addresses of one item for this lane: up items are tiles of W13 (gate tile, and up tile
-// I/16 tiles later), each warp a quarter of K; down items are tiles of W2, each warp an eighth.
-constexpr int UP_W = NCH / 4, UP_S = NCH / 4 / U, DN_W = NCH / 8;
-__device__ __forceinline__ void up_src(int e, int tile, const int4* codes, const int4* scales,
-                                       const int4*& cp, const int4*& sp) {
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, q = warp & 3;
-    const size_t tb = (size_t)e * (2 * I / 16) + tile + (warp >= 4 ? I / 16 : 0);
-    cp = codes + (tb * NCH + q * UP_W) * 32 + lane;
-    sp = scales + (tb * (NCH / U) + q * UP_S) * 32 + lane;
-}
-__device__ __forceinline__ void down_src(int e, int tile, const int4* codes, const int4* scales,
-                                         const int4*& cp, const int4*& sp) {
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const size_t tb = (size_t)e * (H / 16) + tile;
-    cp = codes + (tb * NCH + warp * DN_W) * 32 + lane;
-    sp = scales + (tb * (NCH / U) + warp) * 32 + lane;
-}
-
-template <int MT>
-__device__ __forceinline__ void up_item(const __nv_bfloat16* __restrict__ x, const int* routes, int n, int e,
-                                        int tile, const int4* __restrict__ codes, const int4* __restrict__ scales,
-                                        float gsc, __nv_bfloat16* __restrict__ act, float* red) {
-    const __nv_bfloat16* brow[MT];
-    up_rows<MT>(x, routes, n, brow);
-    const int4 *cp, *sp;
-    up_src(e, tile, codes, scales, cp, sp);
-    float acc[MT][4] = {};
-    warp_tile<MT, UP_W>(cp, sp, brow, acc);
-    up_finish<MT>(acc, routes, n, tile, gsc, act, red);
-}
-
-template <int MT>
-__device__ __forceinline__ void down_item(const __nv_bfloat16* __restrict__ act, const int* routes, int n, int e,
-                                          int tile, const int4* __restrict__ codes, const int4* __restrict__ scales,
-                                          float gsc, __nv_bfloat16* __restrict__ ybuf, float* red) {
-    const __nv_bfloat16* brow[MT];
-    down_rows<MT>(act, routes, n, brow);
-    const int4 *cp, *sp;
-    down_src(e, tile, codes, scales, cp, sp);
-    float acc[MT][4] = {};
-    warp_tile<MT, DN_W>(cp, sp, brow, acc);
-    down_finish<MT>(acc, routes, n, tile, gsc, ybuf, red);
-}
-
-// meta and list come from the route kernel. Under PDL the up kernel is alive while the route
-// kernel writes them, so every read of them goes through L2 (ld.global.cg), never the read-only
-// cache: a read-only (.nc) load of data that a running kernel writes returned stale values.
-struct Group { int e, n; const int* routes; };
-__device__ __forceinline__ Group group(const int* meta, const int* list, int grp) {
-    return {__ldcg(meta + META_E + grp), __ldcg(meta + META_N + grp), list + __ldcg(meta + META_BEG + grp)};
-}
-
-// Probe: the resident blocks of one SM start in lockstep and their items take equal time, so all
-// of them load, then all of them compute. Block slot s (blockIdx / nsm) sleeps s * stagger ns
-// first, so one block can load while the other computes.
-__device__ __forceinline__ void stagger_start(int stagger, int nsm) {
-    if (stagger) {
-        const int slot = blockIdx.x / nsm;
-        if (slot) __nanosleep(slot * stagger);
-    }
-}
-
-// Persistent: blocks walk the items (group, 16-row tile), group-major. 256 threads, 2 blocks/SM.
+// Persistent: blocks walk the items (group, 16-row tile). 256 threads, 2 blocks per SM.
 template <int MT_CAP>
 __global__ void __launch_bounds__(256, 2) moe_up_kernel(
-        const __nv_bfloat16* __restrict__ x, const int* meta, const int* list, int local_start,
-        const int4* __restrict__ codes, const int4* __restrict__ scales, const float* __restrict__ gs,
-        __nv_bfloat16* __restrict__ act, int stagger, int nsm) {
+        const __nv_bfloat16* __restrict__ x, const int* __restrict__ meta, const int* __restrict__ list,
+        int local_start, const int4* __restrict__ codes, const int4* __restrict__ scales,
+        const float* __restrict__ gs, __nv_bfloat16* __restrict__ act) {
     __shared__ float red[8 * 4 * 128];
-    grid_wait();  // meta and list come from the route kernel (PDL)
-    stagger_start(stagger, nsm);
-    const int items = __ldcg(meta) * (I / 16);
+    const int items = meta[0] * (I / 16);
     for (int item = blockIdx.x; item < items; item += gridDim.x) {
-        const int tile = item % (I / 16);
-        const Group G = group(meta, list, item / (I / 16));
-        const float gsc = gs[local_start + G.e] * 256.f;
-        if (MT_CAP == 1 || G.n <= 8) up_item<1>(x, G.routes, G.n, G.e, tile, codes, scales, gsc, act, red);
-        else if (MT_CAP == 2 || G.n <= 16) up_item<2>(x, G.routes, G.n, G.e, tile, codes, scales, gsc, act, red);
-        else up_item<4>(x, G.routes, G.n, G.e, tile, codes, scales, gsc, act, red);
+        const int grp = item / (I / 16), tile = item % (I / 16);
+        const int e = meta[META_E + grp], n = meta[META_N + grp];
+        const int* routes = list + meta[META_BEG + grp];
+        const float gsc = gs[local_start + e] * 256.f;
+        if constexpr (MT_CAP == 1) {
+            up_item<1>(x, routes, n, e, tile, codes, scales, gsc, act, red);
+        } else if constexpr (MT_CAP == 2) {
+            if (n <= 8) up_item<1>(x, routes, n, e, tile, codes, scales, gsc, act, red);
+            else up_item<2>(x, routes, n, e, tile, codes, scales, gsc, act, red);
+        } else {
+            if (n <= 8) up_item<1>(x, routes, n, e, tile, codes, scales, gsc, act, red);
+            else if (n <= 16) up_item<2>(x, routes, n, e, tile, codes, scales, gsc, act, red);
+            else up_item<4>(x, routes, n, e, tile, codes, scales, gsc, act, red);
+        }
     }
 }
 
 // Two resident blocks hide dequant latency; the MT=4 down kernel may spill.
 template <int MT_CAP>
 __global__ void __launch_bounds__(256, 2) moe_down_kernel(
-        const __nv_bfloat16* __restrict__ act, const int* meta, const int* list, int local_start,
-        const int4* __restrict__ codes, const int4* __restrict__ scales, const float* __restrict__ gs,
-        __nv_bfloat16* __restrict__ ybuf, int stagger, int nsm) {
+        const __nv_bfloat16* __restrict__ act, const int* __restrict__ meta, const int* __restrict__ list,
+        int local_start, const int4* __restrict__ codes, const int4* __restrict__ scales,
+        const float* __restrict__ gs, __nv_bfloat16* __restrict__ ybuf) {
     __shared__ float red[8 * 4 * 128];
-    grid_launch_dependents();  // combine blocks (PDL) queue for SMs as down blocks finish
-    stagger_start(stagger, nsm);
-    const int items = __ldcg(meta) * (H / 16);
+    const int items = meta[0] * (H / 16);
     for (int item = blockIdx.x; item < items; item += gridDim.x) {
-        const int tile = item % (H / 16);
-        const Group G = group(meta, list, item / (H / 16));
-        const float gsc = gs[local_start + G.e] * 256.f;
-        if (MT_CAP == 1 || G.n <= 8) down_item<1>(act, G.routes, G.n, G.e, tile, codes, scales, gsc, ybuf, red);
-        else if (MT_CAP == 2 || G.n <= 16) down_item<2>(act, G.routes, G.n, G.e, tile, codes, scales, gsc, ybuf, red);
-        else down_item<4>(act, G.routes, G.n, G.e, tile, codes, scales, gsc, ybuf, red);
+        const int grp = item / (H / 16), tile = item % (H / 16);
+        const int e = meta[META_E + grp], n = meta[META_N + grp];
+        const int* routes = list + meta[META_BEG + grp];
+        const float gsc = gs[local_start + e] * 256.f;
+        if constexpr (MT_CAP == 1) {
+            down_item<1>(act, routes, n, e, tile, codes, scales, gsc, ybuf, red);
+        } else if constexpr (MT_CAP == 2) {
+            if (n <= 8) down_item<1>(act, routes, n, e, tile, codes, scales, gsc, ybuf, red);
+            else down_item<2>(act, routes, n, e, tile, codes, scales, gsc, ybuf, red);
+        } else {
+            if (n <= 8) down_item<1>(act, routes, n, e, tile, codes, scales, gsc, ybuf, red);
+            else if (n <= 16) down_item<2>(act, routes, n, e, tile, codes, scales, gsc, ybuf, red);
+            else down_item<4>(act, routes, n, e, tile, codes, scales, gsc, ybuf, red);
+        }
     }
 }
 
@@ -418,15 +360,14 @@ __global__ void __launch_bounds__(256) moe_combine_kernel(
         const int e = ids[tok * TOPK + s] - local_start;
         if (e >= 0 && e < LOCAL) mask |= 1u << s;
     }
-    grid_wait();  // ybuf comes from the down kernel (PDL); everything above overlapped its tail
     // Load every local route up front so the loads overlap, and keep them for the weighted sum.
     __align__(16) __nv_bfloat162 v[TOPK][8];
 #pragma unroll
     for (int s = 0; s < TOPK; ++s) {
         if (!((mask >> s) & 1u)) continue;
         const int4* y = reinterpret_cast<const int4*>(ybuf + (size_t)(tok * TOPK + s) * H + c);
-        reinterpret_cast<int4*>(v[s])[0] = __ldcg(y);  // written by the down kernel: L2, not nc
-        reinterpret_cast<int4*>(v[s])[1] = __ldcg(y + 1);
+        reinterpret_cast<int4*>(v[s])[0] = y[0];
+        reinterpret_cast<int4*>(v[s])[1] = y[1];
     }
 #pragma unroll
     for (int s = 0; s < TOPK; ++s) {
@@ -465,62 +406,47 @@ __global__ void __launch_bounds__(256) moe_combine_kernel(
     dst[1] = reinterpret_cast<const int4*>(o)[1];
 }
 
-// pdl: launch with programmatic stream serialization, so the kernel may start before the
-// previous one ends; the kernels order themselves with griddepcontrol.
-template <typename... KArgs, typename... Args>
-static cudaError_t launch(bool pdl, void (*kernel)(KArgs...), int grid, cudaStream_t st, Args... args) {
-    cudaLaunchAttribute attr[1];
-    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attr[0].val.programmaticStreamSerializationAllowed = 1;
-    cudaLaunchConfig_t cfg = {};
-    cfg.gridDim = dim3(grid);
-    cfg.blockDim = dim3(256);
-    cfg.dynamicSmemBytes = 0;
-    cfg.stream = st;
-    cfg.attrs = attr;
-    cfg.numAttrs = pdl ? 1 : 0;
-    return cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...);
+template <int MT_CAP>
+static void launch_up(const __nv_bfloat16* x, const int* meta, const int* list, int local_start,
+                      const int4* codes, const int4* scales, const float* gs, __nv_bfloat16* act,
+                      int grid, cudaStream_t st) {
+    moe_up_kernel<MT_CAP><<<grid, 256, 0, st>>>(x, meta, list, local_start, codes, scales, gs, act);
 }
 
 template <int MT_CAP>
-static void launch_experts(bool pdl, int stagger, int nsm, const void* x, const int* meta, const int* list,
-                           int local_start, const void* c13, const void* s13, const float* gs13, const void* c2,
-                           const void* s2, const float* gs2, void* act, void* ybuf, int grid, cudaStream_t st,
-                           cudaError_t& e1, cudaError_t& e2) {
-    e1 = launch(pdl, moe_up_kernel<MT_CAP>, grid, st, (const __nv_bfloat16*)x, meta, list, local_start,
-                (const int4*)c13, (const int4*)s13, gs13, (__nv_bfloat16*)act, stagger, nsm);
-    // Never PDL: its activation loads use the read-only cache, so the up kernel must have ended.
-    e2 = launch(false, moe_down_kernel<MT_CAP>, grid, st, (const __nv_bfloat16*)act, meta, list, local_start,
-                (const int4*)c2, (const int4*)s2, gs2, (__nv_bfloat16*)ybuf, stagger, nsm);
+static void launch_down(const __nv_bfloat16* act, const int* meta, const int* list, int local_start,
+                        const int4* codes, const int4* scales, const float* gs, __nv_bfloat16* ybuf,
+                        int grid, cudaStream_t st) {
+    moe_down_kernel<MT_CAP><<<grid, 256, 0, st>>>(act, meta, list, local_start, codes, scales, gs, ybuf);
 }
 
-// pdl: the up kernel overlaps the route kernel, the combine kernel overlaps the down kernel's tail.
-// grid: two blocks per SM; stagger: see stagger_start.
 cudaError_t moe_launch(const void* x, const int* ids, const float* wts, int M, int local_start,
                        const void* c13, const void* s13, const float* gs13, const void* c2, const void* s2,
                        const float* gs2, const void* norm_w, void* act, void* ybuf, int* meta,
-                       int* list, int grid, void* out, int pdl, int stagger, cudaStream_t st) {
+                       int* list, int grid, void* out, cudaStream_t st) {
     const int n_ids = M * TOPK;
     if (n_ids > 32 * MAX_GROUPS - 32 * LOCAL) return cudaErrorInvalidValue;  // groups always fit
     moe_route_kernel<<<1, 1024, 0, st>>>(ids, n_ids, local_start, meta, list);
-    const int nsm = grid / 2;
-    const int g = M == 8 ? grid + grid / 2 : grid;  // M=8 benefits from three blocks per SM; M=1 does not
-    cudaError_t e1, e2;
     // topk gives each token distinct experts: n<=M, so M<=8 uses MT=1 and M<=16 uses MT<=2.
-    if (M <= 8)
-        launch_experts<1>(pdl, stagger, nsm, x, meta, list, local_start, c13, s13, gs13, c2, s2, gs2, act, ybuf, g,
-                          st, e1, e2);
-    else if (M <= 16)
-        launch_experts<2>(pdl, stagger, nsm, x, meta, list, local_start, c13, s13, gs13, c2, s2, gs2, act, ybuf, g,
-                          st, e1, e2);
-    else
-        launch_experts<4>(pdl, stagger, nsm, x, meta, list, local_start, c13, s13, gs13, c2, s2, gs2, act, ybuf, g,
-                          st, e1, e2);
-    const cudaError_t e3 = launch(pdl, moe_combine_kernel, M, st, ids, wts, local_start,
-                                  (const __nv_bfloat16*)norm_w, (const __nv_bfloat16*)ybuf, (__nv_bfloat16*)out);
-    if (e1 != cudaSuccess) return e1;
-    if (e2 != cudaSuccess) return e2;
-    if (e3 != cudaSuccess) return e3;
+    if (M <= 8) {
+        const int small_grid = M == 8 ? grid + grid / 2 : grid;  // M=8 benefits from three blocks; M=1 does not.
+        launch_up<1>((const __nv_bfloat16*)x, meta, list, local_start, (const int4*)c13, (const int4*)s13,
+                     gs13, (__nv_bfloat16*)act, small_grid, st);
+        launch_down<1>((const __nv_bfloat16*)act, meta, list, local_start, (const int4*)c2, (const int4*)s2,
+                       gs2, (__nv_bfloat16*)ybuf, small_grid, st);
+    } else if (M <= 16) {
+        launch_up<2>((const __nv_bfloat16*)x, meta, list, local_start, (const int4*)c13, (const int4*)s13,
+                     gs13, (__nv_bfloat16*)act, grid, st);
+        launch_down<2>((const __nv_bfloat16*)act, meta, list, local_start, (const int4*)c2, (const int4*)s2,
+                       gs2, (__nv_bfloat16*)ybuf, grid, st);
+    } else {
+        launch_up<4>((const __nv_bfloat16*)x, meta, list, local_start, (const int4*)c13, (const int4*)s13,
+                     gs13, (__nv_bfloat16*)act, grid, st);
+        launch_down<4>((const __nv_bfloat16*)act, meta, list, local_start, (const int4*)c2, (const int4*)s2,
+                       gs2, (__nv_bfloat16*)ybuf, grid, st);
+    }
+    moe_combine_kernel<<<M, 256, 0, st>>>(ids, wts, local_start, (const __nv_bfloat16*)norm_w,
+                                          (const __nv_bfloat16*)ybuf, (__nv_bfloat16*)out);
     return cudaGetLastError();
 }
 """
@@ -532,18 +458,17 @@ CUDA_TORCH = r"""
 cudaError_t moe_launch(const void* x, const int* ids, const float* wts, int M, int local_start,
                        const void* c13, const void* s13, const float* gs13, const void* c2, const void* s2,
                        const float* gs2, const void* norm_w, void* act, void* ybuf, int* meta,
-                       int* list, int grid, void* out, int pdl, int stagger, cudaStream_t st);
+                       int* list, int grid, void* out, cudaStream_t st);
 
 void moe_forward(torch::Tensor x, torch::Tensor ids, torch::Tensor wts, int64_t local_start,
                  torch::Tensor c13, torch::Tensor s13, torch::Tensor gs13, torch::Tensor c2, torch::Tensor s2,
                  torch::Tensor gs2, torch::Tensor norm_w, torch::Tensor act, torch::Tensor ybuf,
-                 torch::Tensor meta, torch::Tensor list, int64_t grid, torch::Tensor out, int64_t pdl,
-                 int64_t stagger) {
+                 torch::Tensor meta, torch::Tensor list, int64_t grid, torch::Tensor out) {
     const cudaError_t err = moe_launch(
         x.data_ptr(), ids.data_ptr<int>(), wts.data_ptr<float>(), x.size(0), local_start, c13.data_ptr(),
         s13.data_ptr(), gs13.data_ptr<float>(), c2.data_ptr(), s2.data_ptr(), gs2.data_ptr<float>(),
-        norm_w.data_ptr(), act.data_ptr(), ybuf.data_ptr(), meta.data_ptr<int>(), list.data_ptr<int>(), grid,
-        out.data_ptr(), pdl, stagger, at::cuda::getCurrentCUDAStream());
+        norm_w.data_ptr(), act.data_ptr(), ybuf.data_ptr(),
+        meta.data_ptr<int>(), list.data_ptr<int>(), grid, out.data_ptr(), at::cuda::getCurrentCUDAStream());
     TORCH_CHECK(err == cudaSuccess, "moe_forward: ", cudaGetErrorString(err));
 }
 """
@@ -552,8 +477,7 @@ CPP_DECLS = """
 void moe_forward(torch::Tensor x, torch::Tensor ids, torch::Tensor wts, int64_t local_start,
                  torch::Tensor c13, torch::Tensor s13, torch::Tensor gs13, torch::Tensor c2, torch::Tensor s2,
                  torch::Tensor gs2, torch::Tensor norm_w, torch::Tensor act, torch::Tensor ybuf,
-                 torch::Tensor meta, torch::Tensor list, int64_t grid, torch::Tensor out, int64_t pdl,
-                 int64_t stagger);
+                 torch::Tensor meta, torch::Tensor list, int64_t grid, torch::Tensor out);
 """
 
 # New nibble p of each packed 32-bit word holds original value NIBBLE_SRC[p] of that word.
@@ -581,11 +505,6 @@ def pack_scales(sf):
 
 
 _MOD = None
-# Judged launch configuration. PDL: the up kernel overlaps the route kernel and the combine kernel
-# overlaps the down kernel. STAGGER: probe only, ns of start delay per resident block slot.
-PDL, STAGGER = 1, 0
-# Timing and correctness table from prepare() (check runs only; False for scored submits).
-BENCH = True
 
 
 def _cuda():
@@ -593,7 +512,7 @@ def _cuda():
     if _MOD is None:
         from torch.utils.cpp_extension import load_inline
         t0 = time.time()
-        _MOD = load_inline(name="muse_moe_v14", cpp_sources=CPP_DECLS, cuda_sources=CUDA_SRC + CUDA_TORCH,
+        _MOD = load_inline(name="muse_moe_v2d", cpp_sources=CPP_DECLS, cuda_sources=CUDA_SRC + CUDA_TORCH,
                            functions=["moe_forward"], extra_cuda_cflags=["-O3"], verbose=False)
         print(f"CUDA compiled in {time.time() - t0:.0f}s", flush=True)
     return _MOD
@@ -608,11 +527,8 @@ def prepare(weights: Weights):
         "norm_w": weights["post_norm_w"].contiguous(),  # BF16, as given; kernels use 1 + w
         "meta": torch.zeros(1 + 3 * MAX_GROUPS, device=weights["w13"].device, dtype=torch.int32),
         "grid": 2 * torch.cuda.get_device_properties(weights["w13"].device).multi_processor_count,  # two resident blocks per SM
-        "pdl": PDL, "stagger": STAGGER,
     }
     _cuda()
-    if BENCH:
-        _bench(state, weights)
     return state
 
 
@@ -626,105 +542,5 @@ def kernel_fn(data: Inputs, state) -> torch.Tensor:
     routes = torch.empty((m * 8,), device=x.device, dtype=torch.int32)
     _MOD.moe_forward(x, ids, data["topk_weights"].contiguous(), data["config"]["local_start"],
                      state["c13"], state["s13"], state["gs13"], state["c2"], state["s2"], state["gs2"],
-                     state["norm_w"], act, ybuf, state["meta"], routes, state["grid"], out,
-                     state["pdl"], state["stagger"])
+                     state["norm_w"], act, ybuf, state["meta"], routes, state["grid"], out)
     return out
-
-
-# ---- timing and correctness table, run from prepare() only when BENCH ----
-
-def _gen(bs, seed):
-    """Routing with the problem's statistics: top-8 of uniform scores plus heavy-tailed expert
-    popularity, rotated so that experts 0-31 are the busiest GPU's."""
-    g = torch.Generator(device="cuda").manual_seed(seed)
-    x = torch.randn((bs, 4096), generator=g, device="cuda").to(torch.bfloat16)
-    scores = torch.rand((bs, 256), generator=g, device="cuda")
-    z = torch.randn((256,), generator=g, device="cuda")
-    u = torch.rand((256,), generator=g, device="cuda").clamp(min=1e-12)
-    scores = scores + 0.03 * z / (-u.log()).sqrt()
-    r = scores.topk(8, dim=-1)
-    ids = r.indices
-    busiest = torch.bincount((ids // 32).flatten(), minlength=8).argmax()
-    ids = (ids - 32 * busiest) % 256
-    return x, ids.to(torch.int32).contiguous(), (r.values / r.values.sum(-1, keepdim=True)).float()
-
-
-def _dequant(codes, sf, gs):
-    """NVFP4 [R, K/2] codes (low nibble first) with E4M3 [R, K/16] block scales -> FP32 [R, K]."""
-    lut = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6], device=codes.device)
-    v = torch.stack((lut[(codes & 15).long()], lut[(codes >> 4).long()]), -1).flatten(-2)
-    return v * sf.float().repeat_interleave(16, -1) * gs
-
-
-def _ref(x, ids, w, weights):
-    """FP32 reference with SGLang's BF16 rounding points (gate/up, activation, y)."""
-    out = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
-    for e in torch.unique(ids[ids < LOCAL]).tolist():
-        tok, slot = (ids == e).nonzero(as_tuple=True)
-        h = x[tok].float() @ _dequant(weights["w13"][e], weights["w13_sf"][e], weights["w13_gs"][e].float()).T
-        gate, up = h[:, :4096].bfloat16().float(), h[:, 4096:].bfloat16().float()
-        a = (torch.nn.functional.silu(gate) * up).bfloat16().float()
-        y = (a @ _dequant(weights["w2"][e], weights["w2_sf"][e], weights["w2_gs"][e].float()).T).bfloat16().float()
-        yn = y * (1 + weights["post_norm_w"].float())
-        yn = yn * torch.rsqrt(yn.pow(2).mean(-1, keepdim=True) + 1e-8)
-        out.index_add_(0, tok, yn * w[tok, slot, None])
-    return out
-
-
-def _graph_us(fn, flush, reps=30):
-    """Median time of one CUDA graph replay of fn with a cold L2, and fn's graph output."""
-    s = torch.cuda.Stream()
-    s.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(s):
-        fn()
-        fn()
-    torch.cuda.current_stream().wait_stream(s)
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
-        out = fn()
-    ev = [(torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for _ in range(reps)]
-    for a, b in ev:
-        flush.sum()  # read more than L2 so the weights come from HBM, as in the judge
-        a.record()
-        g.replay()
-        b.record()
-    torch.cuda.synchronize()
-    ts = sorted(a.elapsed_time(b) * 1e3 for a, b in ev)
-    return ts[len(ts) // 2], out
-
-
-_VARIANTS = (("base", 0, 0), ("pdl", 1, 0), ("st1000", 0, 1000), ("st2000", 0, 2000), ("st3500", 0, 3500),
-             ("st6000", 0, 6000), ("pdl+st2k", 1, 2000))
-
-
-def _bench(state, weights):
-    t0 = time.time()
-    flush = torch.empty(64 << 20, device="cuda", dtype=torch.float32)  # 256 MB, more than L2
-    print("time us (graph, cold L2) per variant, then max rel L2 error (3 eager calls + graph) per variant",
-          flush=True)
-    print("load      seed nexp | " + " ".join(f"{n:>7s}" for n, _, _ in _VARIANTS), flush=True)
-    for bs, name in ((1, "decode 1"), (4, "test 4"), (16, "decode 16"), (32, "decode 32"), (8, "verify 1"),
-                     (128, "verify 16"), (256, "verify 32")):
-        for seed in (101, 202):
-            x, ids, w = _gen(bs, seed)
-            data = {"hidden_states": x, "topk_ids": ids, "topk_weights": w, "config": {"local_start": 0}}
-            nexp = int(torch.unique(ids[ids < LOCAL]).numel())
-            ref = _ref(x, ids, w, weights)
-            rn = ref.norm()
-            ts, errs = [], []
-            for vname, pdl, stagger in _VARIANTS:
-                st = dict(state, pdl=pdl, stagger=stagger)
-                try:
-                    err = 0.0
-                    for _ in range(3):
-                        err = max(err, float((kernel_fn(data, st).float() - ref).norm() / rn))
-                    t, out = _graph_us(lambda: kernel_fn(data, st), flush)
-                    err = max(err, float((out.float() - ref).norm() / rn))
-                except Exception as e:  # report and keep measuring the other variants
-                    print(f"  {name} {vname} failed: {e}", flush=True)
-                    t, err = float("nan"), float("nan")
-                ts.append(t)
-                errs.append(err)
-            print(f"{name:9s} {seed:4d} {nexp:4d} | " + " ".join(f"{t:7.1f}" for t in ts), flush=True)
-            print(f"{'':19s} | " + " ".join(f"{e:7.1e}" for e in errs), flush=True)
-    print(f"bench took {time.time() - t0:.0f}s", flush=True)
