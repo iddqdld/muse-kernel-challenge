@@ -564,7 +564,7 @@ def pack_scales(sf):
 
 
 DQ = 1         # judged dequant layout: 1 = v12 rotate-and-mask, 0 = v11
-BENCH = True   # A/B timing and correctness table from prepare() (check runs only)
+BENCH = False  # A/B timing and correctness table from prepare() (check runs only)
 _MODS = {}
 
 
