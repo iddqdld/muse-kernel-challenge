@@ -67,12 +67,6 @@ CUDA_SRC = r"""
 #include <cuda_fp16.h>
 #include <stdint.h>
 
-#ifndef RED2
-#define RED2 0
-#endif
-#ifndef DN2
-#define DN2 0
-#endif
 constexpr int H = 4096, I = 4096, TOPK = 8, LOCAL = 32;
 constexpr int NCH = 64;  // 64-wide k chunks per row (K = 4096 in both GEMMs)
 constexpr int U = 8;     // chunks per iteration: one int4 of block scales per lane
@@ -273,12 +267,9 @@ __device__ __forceinline__ void up_item(const __nv_bfloat16* __restrict__ x, con
             act[(size_t)routes[i] * I + tile * 16 + row] = __float2bfloat16_rn(gate / (1.f + __expf(-gate)) * up);
         }
     }
-#if !RED2
-    __syncthreads();  // with RED2 the next item writes the other reduction buffer
-#endif
+    // No closing barrier: the next item stores into the other reduction buffer.
 }
 
-#if DN2
 // Down item = tiles 2p (warps 0-3) and 2p + 1 (warps 4-7) of W2 of local expert e, each warp a
 // quarter of K, as in the up kernel: half the barriers and epilogues per weight byte of 1-tile
 // items. y -> ybuf[route] in BF16 (as SGLang keeps it).
@@ -309,51 +300,14 @@ __device__ __forceinline__ void down_item(const __nv_bfloat16* __restrict__ act,
         elem(el, i, row);
         if (i < n) ybuf[(size_t)routes[i] * H + (2 * pair + half) * 16 + row] = __float2bfloat16_rn(y * gsc);
     }
-#if !RED2
-    __syncthreads();
-#endif
+    // No closing barrier: the next item stores into the other reduction buffer.
 }
 constexpr int DN_ITEMS = H / 32;  // down items per group
-#else
-// Down tile `tile` of local expert e: 8 warps, each an eighth of K. y -> ybuf[route] in BF16 (as
-// SGLang keeps it). The combine kernel sums the squares of y * (1 + w).
-template <int MT>
-__device__ __forceinline__ void down_item(const __nv_bfloat16* __restrict__ act, const int* __restrict__ routes, int n,
-                                          int e, int tile, const int4* __restrict__ codes,
-                                          const int4* __restrict__ scales, float gsc,
-                                          __nv_bfloat16* __restrict__ ybuf, float* red) {
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
-    const size_t tb = (size_t)e * (H / 16) + tile;
-    const __nv_bfloat16* brow[MT];
-#pragma unroll
-    for (int nt = 0; nt < MT; ++nt) {
-        const int i = nt * 8 + g;
-        brow[nt] = act + (size_t)routes[i < n ? i : 0] * I + warp * (I / 8) + t * 16;
-    }
-    float acc[MT][4] = {};
-    warp_tile<MT, NCH / 8>(codes + (tb * NCH + warp * (NCH / 8)) * 32 + lane,
-                           scales + (tb * (NCH / U) + warp) * 32 + lane, brow, acc);
-    store_partial<MT>(red, acc);
-    __syncthreads();
-    for (int e2 = threadIdx.x; e2 < MT * 128; e2 += blockDim.x) {
-        float y = 0.f;
-#pragma unroll
-        for (int w = 0; w < 8; ++w) y += red[w * MT * 128 + e2];
-        int i, row;
-        elem(e2, i, row);
-        if (i < n) ybuf[(size_t)routes[i] * H + tile * 16 + row] = __float2bfloat16_rn(y * gsc);
-    }
-#if !RED2
-    __syncthreads();
-#endif
-}
-constexpr int DN_ITEMS = H / 16;  // down items per group
-#endif
 
-// Reduction buffer: with RED2 two of them alternate between items, so an item needs only the
-// barrier between its partial stores and its reduction (the next item's barrier separates the
-// reads of buffer b from the writes two items later).
-constexpr int NRED = RED2 ? 2 : 1;
+// Two reduction buffers alternate between items, so an item needs only the barrier between its
+// partial stores and its reduction: the next item's barrier separates the reads of buffer b from
+// its writes two items later.
+constexpr int NRED = 2;
 
 // Persistent: blocks walk the items (group, 16-row tile). 256 threads, 2 blocks per SM.
 template <int MT_CAP>
@@ -383,7 +337,7 @@ __global__ void __launch_bounds__(256, 2) moe_up_kernel(
     }
 }
 
-// Two resident blocks hide dequant latency; the MT=4 down kernel may spill.
+// Two resident blocks hide dequant latency.
 template <int MT_CAP>
 __global__ void __launch_bounds__(256, 2) moe_down_kernel(
         const __nv_bfloat16* __restrict__ act, const int* __restrict__ meta, const int* __restrict__ list,
@@ -496,17 +450,16 @@ static void launch_down(const __nv_bfloat16* act, const int* meta, const int* li
 cudaError_t moe_launch(const void* x, const int* ids, const float* wts, int M, int local_start,
                        const void* c13, const void* s13, const float* gs13, const void* c2, const void* s2,
                        const float* gs2, const void* norm_w, void* act, void* ybuf, int* meta,
-                       int* list, int grid, int grid_small, void* out, cudaStream_t st) {
+                       int* list, int grid, void* out, cudaStream_t st) {
     const int n_ids = M * TOPK;
     if (n_ids > 32 * MAX_GROUPS - 32 * LOCAL) return cudaErrorInvalidValue;  // groups always fit
     moe_route_kernel<<<1, 1024, 0, st>>>(ids, n_ids, local_start, meta, list);
     // topk gives each token distinct experts: n<=M, so M<=8 uses MT=1 and M<=16 uses MT<=2.
     if (M <= 8) {
-        const int small_grid = grid_small;  // MT1 kernels fit three blocks per SM; the host picks per M
         launch_up<1>((const __nv_bfloat16*)x, meta, list, local_start, (const int4*)c13, (const int4*)s13,
-                     gs13, (__nv_bfloat16*)act, small_grid, st);
+                     gs13, (__nv_bfloat16*)act, grid, st);
         launch_down<1>((const __nv_bfloat16*)act, meta, list, local_start, (const int4*)c2, (const int4*)s2,
-                       gs2, (__nv_bfloat16*)ybuf, small_grid, st);
+                       gs2, (__nv_bfloat16*)ybuf, grid, st);
     } else if (M <= 16) {
         launch_up<2>((const __nv_bfloat16*)x, meta, list, local_start, (const int4*)c13, (const int4*)s13,
                      gs13, (__nv_bfloat16*)act, grid, st);
@@ -531,17 +484,17 @@ CUDA_TORCH = r"""
 cudaError_t moe_launch(const void* x, const int* ids, const float* wts, int M, int local_start,
                        const void* c13, const void* s13, const float* gs13, const void* c2, const void* s2,
                        const float* gs2, const void* norm_w, void* act, void* ybuf, int* meta,
-                       int* list, int grid, int grid_small, void* out, cudaStream_t st);
+                       int* list, int grid, void* out, cudaStream_t st);
 
 void moe_forward(torch::Tensor x, torch::Tensor ids, torch::Tensor wts, int64_t local_start,
                  torch::Tensor c13, torch::Tensor s13, torch::Tensor gs13, torch::Tensor c2, torch::Tensor s2,
                  torch::Tensor gs2, torch::Tensor norm_w, torch::Tensor act, torch::Tensor ybuf,
-                 torch::Tensor meta, torch::Tensor list, int64_t grid, int64_t grid_small, torch::Tensor out) {
+                 torch::Tensor meta, torch::Tensor list, int64_t grid, torch::Tensor out) {
     const cudaError_t err = moe_launch(
         x.data_ptr(), ids.data_ptr<int>(), wts.data_ptr<float>(), x.size(0), local_start, c13.data_ptr(),
         s13.data_ptr(), gs13.data_ptr<float>(), c2.data_ptr(), s2.data_ptr(), gs2.data_ptr<float>(),
         norm_w.data_ptr(), act.data_ptr(), ybuf.data_ptr(),
-        meta.data_ptr<int>(), list.data_ptr<int>(), grid, grid_small, out.data_ptr(), at::cuda::getCurrentCUDAStream());
+        meta.data_ptr<int>(), list.data_ptr<int>(), grid, out.data_ptr(), at::cuda::getCurrentCUDAStream());
     TORCH_CHECK(err == cudaSuccess, "moe_forward: ", cudaGetErrorString(err));
 }
 """
@@ -550,7 +503,7 @@ CPP_DECLS = """
 void moe_forward(torch::Tensor x, torch::Tensor ids, torch::Tensor wts, int64_t local_start,
                  torch::Tensor c13, torch::Tensor s13, torch::Tensor gs13, torch::Tensor c2, torch::Tensor s2,
                  torch::Tensor gs2, torch::Tensor norm_w, torch::Tensor act, torch::Tensor ybuf,
-                 torch::Tensor meta, torch::Tensor list, int64_t grid, int64_t grid_small, torch::Tensor out);
+                 torch::Tensor meta, torch::Tensor list, int64_t grid, torch::Tensor out);
 """
 
 # Bit j (j=3 is the sign) of logical code v of a packed 32-bit word sits at word bit CODE_POS[v][j].
@@ -590,39 +543,33 @@ def pack_scales(sf):
     return s.permute(0, 1, 4, 3, 6, 5, 2).reshape(e, r // 16, nb // 32, 32, 16).contiguous()
 
 
-# Judged build: (RED2, DN2) flags of the CUDA source, and blocks per SM for M <= 8 by M.
-BUILD = (1, 1)
-SMALL_BPS = {8: 3}  # default 2
-BENCH = True  # variant timing and correctness table from prepare() (check runs only)
-_MODS = {}
+BENCH = False  # timing and correctness table from prepare() (check runs only)
+_MOD = None
 
 
-def _cuda(build):
-    if build not in _MODS:
+def _cuda():
+    global _MOD
+    if _MOD is None:
         from torch.utils.cpp_extension import load_inline
         t0 = time.time()
-        red2, dn2 = build
-        _MODS[build] = load_inline(name=f"muse_moe_v13_r{red2}d{dn2}", cpp_sources=CPP_DECLS,
-                                   cuda_sources=CUDA_SRC + CUDA_TORCH, functions=["moe_forward"],
-                                   extra_cuda_cflags=["-O3", f"-DRED2={red2}", f"-DDN2={dn2}"], verbose=False)
-        print(f"CUDA RED2={red2} DN2={dn2} compiled in {time.time() - t0:.0f}s", flush=True)
-    return _MODS[build]
+        _MOD = load_inline(name="muse_moe_v13", cpp_sources=CPP_DECLS, cuda_sources=CUDA_SRC + CUDA_TORCH,
+                           functions=["moe_forward"], extra_cuda_cflags=["-O3"], verbose=False)
+        print(f"CUDA compiled in {time.time() - t0:.0f}s", flush=True)
+    return _MOD
 
 
 def prepare(weights: Weights):
     loc = slice(0, LOCAL)  # every case runs ep8 on experts 0-31
     dev = weights["w13"].device
-    nsm = torch.cuda.get_device_properties(dev).multi_processor_count
     state = {
         "c13": pack_codes(weights["w13"][loc], weights["w13_sf"][loc]), "s13": pack_scales(weights["w13_sf"][loc]),
         "c2": pack_codes(weights["w2"][loc], weights["w2_sf"][loc]), "s2": pack_scales(weights["w2_sf"][loc]),
         "gs13": weights["w13_gs"].float().contiguous(), "gs2": weights["w2_gs"].float().contiguous(),
         "norm_w": weights["post_norm_w"].contiguous(),  # BF16, as given; kernels use 1 + w
         "meta": torch.zeros(1 + 3 * MAX_GROUPS, device=dev, dtype=torch.int32),
-        "nsm": nsm, "build": BUILD, "small_bps": SMALL_BPS,
+        "grid": 2 * torch.cuda.get_device_properties(dev).multi_processor_count,  # two resident blocks per SM
     }
-    for build in (((0, 0), (1, 0), (0, 1), (1, 1)) if BENCH else (BUILD,)):
-        _cuda(build)
+    _cuda()
     if BENCH:
         _bench(state, weights)
     return state
@@ -636,15 +583,13 @@ def kernel_fn(data: Inputs, state) -> torch.Tensor:
     act = torch.empty((m * 8, 4096), device=x.device, dtype=torch.bfloat16)
     ybuf = torch.empty((m * 8, h), device=x.device, dtype=torch.bfloat16)
     routes = torch.empty((m * 8,), device=x.device, dtype=torch.int32)
-    nsm = state["nsm"]
-    _MODS[state["build"]].moe_forward(
-        x, ids, data["topk_weights"].contiguous(), data["config"]["local_start"], state["c13"], state["s13"],
-        state["gs13"], state["c2"], state["s2"], state["gs2"], state["norm_w"], act, ybuf, state["meta"], routes,
-        2 * nsm, state["small_bps"].get(m, 2) * nsm, out)
+    _MOD.moe_forward(x, ids, data["topk_weights"].contiguous(), data["config"]["local_start"],
+                     state["c13"], state["s13"], state["gs13"], state["c2"], state["s2"], state["gs2"],
+                     state["norm_w"], act, ybuf, state["meta"], routes, state["grid"], out)
     return out
 
 
-# ---- A/B timing and correctness table, run from prepare() only when BENCH ----
+# ---- timing and correctness table, run from prepare() only when BENCH ----
 
 def _gen(bs, seed):
     """Routing with the problem's statistics: top-8 of uniform scores plus heavy-tailed expert
@@ -706,16 +651,10 @@ def _graph_us(fn, flush, reps=30):
     return ts[len(ts) // 2], out
 
 
-_VARIANTS = (("v12", (0, 0), {8: 3}), ("red2", (1, 0), {8: 3}), ("dn2", (0, 1), {8: 3}), ("both", (1, 1), {8: 3}),
-             ("v12 bps2", (0, 0), {}), ("v12 bps3", (0, 0), {1: 3, 4: 3, 8: 3}))
-
-
 def _bench(state, weights):
     t0 = time.time()
     flush = torch.empty(64 << 20, device="cuda", dtype=torch.float32)  # 256 MB, more than L2
-    print("graph us (cold L2) per variant, then max rel L2 error vs FP32 reference (3 eager calls + graph)",
-          flush=True)
-    print("load      seed nexp | " + " ".join(f"{n:>9s}" for n, _, _ in _VARIANTS), flush=True)
+    print("graph us (cold L2) and max rel L2 error vs FP32 reference (3 eager calls + graph)", flush=True)
     for bs, name in ((1, "decode 1"), (4, "test 4"), (16, "decode 16"), (32, "decode 32"), (8, "verify 1"),
                      (128, "verify 16"), (256, "verify 32")):
         for seed in (101, 202):
@@ -724,15 +663,10 @@ def _bench(state, weights):
             nexp = int(torch.unique(ids[ids < LOCAL]).numel())
             ref = _ref(x, ids, w, weights)
             rn = ref.norm()
-            ts, errs = [], []
-            for _, build, bps in _VARIANTS:
-                st = dict(state, build=build, small_bps=bps)
-                err = 0.0
-                for _ in range(3):
-                    err = max(err, float((kernel_fn(data, st).float() - ref).norm() / rn))
-                t, out = _graph_us(lambda: kernel_fn(data, st), flush)
-                ts.append(t)
-                errs.append(max(err, float((out.float() - ref).norm() / rn)))
-            print(f"{name:9s} {seed:4d} {nexp:4d} | " + " ".join(f"{t:9.1f}" for t in ts), flush=True)
-            print(f"{'':19s} | " + " ".join(f"{e:9.1e}" for e in errs), flush=True)
+            err = 0.0
+            for _ in range(3):
+                err = max(err, float((kernel_fn(data, state).float() - ref).norm() / rn))
+            t, out = _graph_us(lambda: kernel_fn(data, state), flush)
+            err = max(err, float((out.float() - ref).norm() / rn))
+            print(f"{name:9s} {seed:4d} {nexp:4d} | {t:8.1f} us | {err:8.1e}", flush=True)
     print(f"bench took {time.time() - t0:.0f}s", flush=True)
