@@ -11,9 +11,9 @@ combine (one 256-thread block per token): out = sum over its local routes of
   weight * yn * rsqrt(mean(yn^2) + eps), yn = y * (1 + post_norm_w). For each route the block
   sums yn^2 over all H columns itself, so no other kernel writes per-route sums.
 
-The four kernels run with programmatic dependent launch (PDL): each kernel lets the next one
-launch early, and the next one waits (griddepcontrol.wait) only before it reads the previous
-kernel's output. The down kernel issues its first weight loads before that wait.
+The up and combine kernels run with programmatic dependent launch (PDL): each starts while the
+kernel before it finishes, and waits (griddepcontrol.wait) only before it reads that kernel's
+output, through L2 loads (a read-only-cache load of data a running kernel writes can be stale).
 
 Weights are repacked once in prepare(), losslessly (still E2M1 codes and E4M3 block scales):
 - per 16-row tile, 64-wide k chunk and lane (g = lane / 4, t = lane % 4), one int4 holds the
@@ -178,13 +178,17 @@ __global__ void __launch_bounds__(1024) moe_route_kernel(const int* __restrict__
     }
 }
 
-// Dequantize a warp's packed chunks (already in registers) and run the MMAs. NC: read the
-// activation fragments through the read-only cache. That is only valid for data that no running
-// kernel writes: under PDL the up kernel writes act while the down kernel is alive, so the down
-// kernel then uses L2 loads.
-template <int MT, int NCHUNK, bool NC>
-__device__ __forceinline__ void warp_compute(const int4 (&w)[NCHUNK], const int4 (&s)[NCHUNK / U],
-                                             const __nv_bfloat16* const (&brow)[MT], float (&acc)[MT][4]) {
+// Each warp issues all of its packed weight loads, then dequantizes and consumes them in order.
+// The activation fragments go through the read-only cache: no kernel that is still running
+// writes them (the down kernel is not launched with PDL, so the up kernel has ended).
+template <int MT, int NCHUNK>
+__device__ __forceinline__ void warp_tile(const int4* __restrict__ cp, const int4* __restrict__ sp,
+                                          const __nv_bfloat16* const (&brow)[MT], float (&acc)[MT][4]) {
+    int4 w[NCHUNK], s[NCHUNK / U];
+#pragma unroll
+    for (int u = 0; u < NCHUNK; ++u) w[u] = ld_stream(cp + u * 32);
+#pragma unroll
+    for (int q = 0; q < NCHUNK / U; ++q) s[q] = ld_stream(sp + q * 32);
 #pragma unroll
     for (int u = 0; u < NCHUNK; ++u) {
         const uint32_t sw = reinterpret_cast<const uint32_t*>(&s[u / U])[(u % U) >> 1] >> ((u & 1) * 16);
@@ -193,37 +197,17 @@ __device__ __forceinline__ void warp_compute(const int4 (&w)[NCHUNK], const int4
             uint32_t A[2][4];
             dequant_lo(w[u], s_lo, s_hi, A);
 #pragma unroll
-            for (int nt = 0; nt < MT; ++nt) {
-                const int4* p = reinterpret_cast<const int4*>(brow[nt] + u * 64);
-                mma_lo(acc[nt], A, NC ? __ldg(p) : __ldcg(p));
-            }
+            for (int nt = 0; nt < MT; ++nt)
+                mma_lo(acc[nt], A, __ldg(reinterpret_cast<const int4*>(brow[nt] + u * 64)));
         }
         {
             uint32_t A[2][4];
             dequant_hi(w[u], s_lo, s_hi, A);
 #pragma unroll
-            for (int nt = 0; nt < MT; ++nt) {
-                const int4* p = reinterpret_cast<const int4*>(brow[nt] + u * 64) + 1;
-                mma_hi(acc[nt], A, NC ? __ldg(p) : __ldcg(p));
-            }
+            for (int nt = 0; nt < MT; ++nt)
+                mma_hi(acc[nt], A, __ldg(reinterpret_cast<const int4*>(brow[nt] + u * 64) + 1));
         }
     }
-}
-
-// Each warp issues all of its packed weight loads, then dequantizes and consumes them in order.
-// `wait`: the activations come from the previous kernel (PDL), so wait for it after the weight
-// loads are in flight.
-template <int MT, int NCHUNK, bool NC>
-__device__ __forceinline__ void warp_tile(const int4* __restrict__ cp, const int4* __restrict__ sp,
-                                          const __nv_bfloat16* const (&brow)[MT], float (&acc)[MT][4],
-                                          bool wait) {
-    int4 w[NCHUNK], s[NCHUNK / U];
-#pragma unroll
-    for (int u = 0; u < NCHUNK; ++u) w[u] = ld_stream(cp + u * 32);
-#pragma unroll
-    for (int q = 0; q < NCHUNK / U; ++q) s[q] = ld_stream(sp + q * 32);
-    if (wait) grid_wait();
-    warp_compute<MT, NCHUNK, NC>(w, s, brow, acc);
 }
 
 template <int MT>
@@ -312,7 +296,7 @@ __device__ __forceinline__ void down_finish(const float (&acc)[MT][4], const int
 
 // Weight addresses of one item for this lane: up items are tiles of W13 (gate tile, and up tile
 // I/16 tiles later), each warp a quarter of K; down items are tiles of W2, each warp an eighth.
-constexpr int UP_W = NCH / 4, UP_S = NCH / 4 / U, DN_W = NCH / 8, DN_S = 1;
+constexpr int UP_W = NCH / 4, UP_S = NCH / 4 / U, DN_W = NCH / 8;
 __device__ __forceinline__ void up_src(int e, int tile, const int4* codes, const int4* scales,
                                        const int4*& cp, const int4*& sp) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, q = warp & 3;
@@ -337,28 +321,39 @@ __device__ __forceinline__ void up_item(const __nv_bfloat16* __restrict__ x, con
     const int4 *cp, *sp;
     up_src(e, tile, codes, scales, cp, sp);
     float acc[MT][4] = {};
-    warp_tile<MT, UP_W, true>(cp, sp, brow, acc, false);
+    warp_tile<MT, UP_W>(cp, sp, brow, acc);
     up_finish<MT>(acc, routes, n, tile, gsc, act, red);
 }
 
-template <int MT, bool NC>
+template <int MT>
 __device__ __forceinline__ void down_item(const __nv_bfloat16* __restrict__ act, const int* routes, int n, int e,
                                           int tile, const int4* __restrict__ codes, const int4* __restrict__ scales,
-                                          float gsc, __nv_bfloat16* __restrict__ ybuf, float* red, bool first) {
+                                          float gsc, __nv_bfloat16* __restrict__ ybuf, float* red) {
     const __nv_bfloat16* brow[MT];
     down_rows<MT>(act, routes, n, brow);
     const int4 *cp, *sp;
     down_src(e, tile, codes, scales, cp, sp);
     float acc[MT][4] = {};
-    warp_tile<MT, DN_W, NC>(cp, sp, brow, acc, first);
+    warp_tile<MT, DN_W>(cp, sp, brow, acc);
     down_finish<MT>(acc, routes, n, tile, gsc, ybuf, red);
 }
 
-// meta and list come from the route kernel. Under PDL this kernel is alive while the route kernel
-// writes them, so every read of them goes through L2 (ld.global.cg), never the read-only cache.
+// meta and list come from the route kernel. Under PDL the up kernel is alive while the route
+// kernel writes them, so every read of them goes through L2 (ld.global.cg), never the read-only
+// cache: a read-only (.nc) load of data that a running kernel writes returned stale values.
 struct Group { int e, n; const int* routes; };
 __device__ __forceinline__ Group group(const int* meta, const int* list, int grp) {
     return {__ldcg(meta + META_E + grp), __ldcg(meta + META_N + grp), list + __ldcg(meta + META_BEG + grp)};
+}
+
+// Probe: the resident blocks of one SM start in lockstep and their items take equal time, so all
+// of them load, then all of them compute. Block slot s (blockIdx / nsm) sleeps s * stagger ns
+// first, so one block can load while the other computes.
+__device__ __forceinline__ void stagger_start(int stagger, int nsm) {
+    if (stagger) {
+        const int slot = blockIdx.x / nsm;
+        if (slot) __nanosleep(slot * stagger);
+    }
 }
 
 // Persistent: blocks walk the items (group, 16-row tile), group-major. 256 threads, 2 blocks/SM.
@@ -366,10 +361,10 @@ template <int MT_CAP>
 __global__ void __launch_bounds__(256, 2) moe_up_kernel(
         const __nv_bfloat16* __restrict__ x, const int* meta, const int* list, int local_start,
         const int4* __restrict__ codes, const int4* __restrict__ scales, const float* __restrict__ gs,
-        __nv_bfloat16* __restrict__ act) {
+        __nv_bfloat16* __restrict__ act, int stagger, int nsm) {
     __shared__ float red[8 * 4 * 128];
-    grid_wait();               // meta and list come from the route kernel
-    grid_launch_dependents();  // down blocks take each SM as soon as its up blocks finish
+    grid_wait();  // meta and list come from the route kernel (PDL)
+    stagger_start(stagger, nsm);
     const int items = __ldcg(meta) * (I / 16);
     for (int item = blockIdx.x; item < items; item += gridDim.x) {
         const int tile = item % (I / 16);
@@ -381,156 +376,23 @@ __global__ void __launch_bounds__(256, 2) moe_up_kernel(
     }
 }
 
-// Two resident blocks hide dequant latency; the MT=4 down kernel may spill. Under PDL a down
-// block starts while the up kernel still runs; it issues its first weight loads, then waits.
-template <int MT_CAP, bool NC>
+// Two resident blocks hide dequant latency; the MT=4 down kernel may spill.
+template <int MT_CAP>
 __global__ void __launch_bounds__(256, 2) moe_down_kernel(
         const __nv_bfloat16* __restrict__ act, const int* meta, const int* list, int local_start,
         const int4* __restrict__ codes, const int4* __restrict__ scales, const float* __restrict__ gs,
-        __nv_bfloat16* __restrict__ ybuf) {
+        __nv_bfloat16* __restrict__ ybuf, int stagger, int nsm) {
     __shared__ float red[8 * 4 * 128];
-    grid_launch_dependents();  // combine blocks queue for SMs as down blocks finish
+    grid_launch_dependents();  // combine blocks (PDL) queue for SMs as down blocks finish
+    stagger_start(stagger, nsm);
     const int items = __ldcg(meta) * (H / 16);
-    bool first = true;
     for (int item = blockIdx.x; item < items; item += gridDim.x) {
         const int tile = item % (H / 16);
         const Group G = group(meta, list, item / (H / 16));
         const float gsc = gs[local_start + G.e] * 256.f;
-        if (MT_CAP == 1 || G.n <= 8)
-            down_item<1, NC>(act, G.routes, G.n, G.e, tile, codes, scales, gsc, ybuf, red, first);
-        else if (MT_CAP == 2 || G.n <= 16)
-            down_item<2, NC>(act, G.routes, G.n, G.e, tile, codes, scales, gsc, ybuf, red, first);
-        else
-            down_item<4, NC>(act, G.routes, G.n, G.e, tile, codes, scales, gsc, ybuf, red, first);
-        first = false;
-    }
-}
-
-// ---- one-stage cp.async prefetch ("pipe") ----
-// While a block computes item i from registers, the weights of its next item stream into shared
-// memory. Each thread copies and reads back only its own 16-byte slots (stage[j * 256 + tid]), so
-// no barrier guards the stage; cp.async.wait_group 0 orders a thread's copies before its reads.
-// One stage per block keeps two blocks per SM: up 72 KB + 16 KB, down 36 KB + 16 KB.
-constexpr int UP_STAGE = (UP_W + UP_S) * 256 * 16, DN_STAGE = (DN_W + DN_S) * 256 * 16;
-
-__device__ __forceinline__ void cp_async16(int4* smem, const int4* gmem) {
-    const uint32_t a = (uint32_t)__cvta_generic_to_shared(smem);
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(a), "l"(gmem) : "memory");
-}
-
-template <int NW, int NS>
-__device__ __forceinline__ void stage_issue(int4* stage, const int4* cp, const int4* sp) {
-    const int tid = threadIdx.x;
-#pragma unroll
-    for (int u = 0; u < NW; ++u) cp_async16(stage + u * 256 + tid, cp + u * 32);
-#pragma unroll
-    for (int q = 0; q < NS; ++q) cp_async16(stage + (NW + q) * 256 + tid, sp + q * 32);
-    asm volatile("cp.async.commit_group;" ::: "memory");
-}
-
-template <int NW, int NS>
-__device__ __forceinline__ void stage_read(const int4* stage, int4 (&w)[NW], int4 (&s)[NS]) {
-    const int tid = threadIdx.x;
-    asm volatile("cp.async.wait_group 0;" ::: "memory");
-#pragma unroll
-    for (int u = 0; u < NW; ++u) w[u] = stage[u * 256 + tid];
-#pragma unroll
-    for (int q = 0; q < NS; ++q) s[q] = stage[(NW + q) * 256 + tid];
-}
-
-template <int MT_CAP>
-__global__ void __launch_bounds__(256, 2) moe_up_pipe(
-        const __nv_bfloat16* __restrict__ x, const int* meta, const int* list, int local_start,
-        const int4* __restrict__ codes, const int4* __restrict__ scales, const float* __restrict__ gs,
-        __nv_bfloat16* __restrict__ act) {
-    extern __shared__ int4 stage[];
-    __shared__ float red[8 * 4 * 128];
-    grid_wait();
-    grid_launch_dependents();
-    const int items = __ldcg(meta) * (I / 16);
-    int item = blockIdx.x;
-    if (item >= items) return;
-    const int4 *cp, *sp;
-    up_src(group(meta, list, item / (I / 16)).e, item % (I / 16), codes, scales, cp, sp);
-    stage_issue<UP_W, UP_S>(stage, cp, sp);
-    for (; item < items; item += gridDim.x) {
-        int4 w[UP_W], s[UP_S];
-        stage_read<UP_W, UP_S>(stage, w, s);
-        const int nxt = item + gridDim.x;
-        if (nxt < items) {
-            up_src(group(meta, list, nxt / (I / 16)).e, nxt % (I / 16), codes, scales, cp, sp);
-            stage_issue<UP_W, UP_S>(stage, cp, sp);
-        }
-        const int tile = item % (I / 16);
-        const Group G = group(meta, list, item / (I / 16));
-        const float gsc = gs[local_start + G.e] * 256.f;
-        if (MT_CAP == 1 || G.n <= 8) {
-            const __nv_bfloat16* brow[1];
-            up_rows<1>(x, G.routes, G.n, brow);
-            float acc[1][4] = {};
-            warp_compute<1, UP_W, true>(w, s, brow, acc);
-            up_finish<1>(acc, G.routes, G.n, tile, gsc, act, red);
-        } else if (MT_CAP == 2 || G.n <= 16) {
-            const __nv_bfloat16* brow[2];
-            up_rows<2>(x, G.routes, G.n, brow);
-            float acc[2][4] = {};
-            warp_compute<2, UP_W, true>(w, s, brow, acc);
-            up_finish<2>(acc, G.routes, G.n, tile, gsc, act, red);
-        } else {
-            const __nv_bfloat16* brow[4];
-            up_rows<4>(x, G.routes, G.n, brow);
-            float acc[4][4] = {};
-            warp_compute<4, UP_W, true>(w, s, brow, acc);
-            up_finish<4>(acc, G.routes, G.n, tile, gsc, act, red);
-        }
-    }
-}
-
-template <int MT_CAP, bool NC>
-__global__ void __launch_bounds__(256, 2) moe_down_pipe(
-        const __nv_bfloat16* __restrict__ act, const int* meta, const int* list, int local_start,
-        const int4* __restrict__ codes, const int4* __restrict__ scales, const float* __restrict__ gs,
-        __nv_bfloat16* __restrict__ ybuf) {
-    extern __shared__ int4 stage[];
-    __shared__ float red[8 * 4 * 128];
-    grid_launch_dependents();
-    const int items = __ldcg(meta) * (H / 16);
-    int item = blockIdx.x;
-    if (item >= items) return;
-    const int4 *cp, *sp;
-    down_src(group(meta, list, item / (H / 16)).e, item % (H / 16), codes, scales, cp, sp);
-    stage_issue<DN_W, DN_S>(stage, cp, sp);  // weights only: safe before the up kernel ends
-    grid_wait();                              // act comes from the up kernel
-    for (; item < items; item += gridDim.x) {
-        int4 w[DN_W], s[DN_S];
-        stage_read<DN_W, DN_S>(stage, w, s);
-        const int nxt = item + gridDim.x;
-        if (nxt < items) {
-            down_src(group(meta, list, nxt / (H / 16)).e, nxt % (H / 16), codes, scales, cp, sp);
-            stage_issue<DN_W, DN_S>(stage, cp, sp);
-        }
-        const int tile = item % (H / 16);
-        const Group G = group(meta, list, item / (H / 16));
-        const float gsc = gs[local_start + G.e] * 256.f;
-        if (MT_CAP == 1 || G.n <= 8) {
-            const __nv_bfloat16* brow[1];
-            down_rows<1>(act, G.routes, G.n, brow);
-            float acc[1][4] = {};
-            warp_compute<1, DN_W, NC>(w, s, brow, acc);
-            down_finish<1>(acc, G.routes, G.n, tile, gsc, ybuf, red);
-        } else if (MT_CAP == 2 || G.n <= 16) {
-            const __nv_bfloat16* brow[2];
-            down_rows<2>(act, G.routes, G.n, brow);
-            float acc[2][4] = {};
-            warp_compute<2, DN_W, NC>(w, s, brow, acc);
-            down_finish<2>(acc, G.routes, G.n, tile, gsc, ybuf, red);
-        } else {
-            const __nv_bfloat16* brow[4];
-            down_rows<4>(act, G.routes, G.n, brow);
-            float acc[4][4] = {};
-            warp_compute<4, DN_W, NC>(w, s, brow, acc);
-            down_finish<4>(acc, G.routes, G.n, tile, gsc, ybuf, red);
-        }
+        if (MT_CAP == 1 || G.n <= 8) down_item<1>(act, G.routes, G.n, G.e, tile, codes, scales, gsc, ybuf, red);
+        else if (MT_CAP == 2 || G.n <= 16) down_item<2>(act, G.routes, G.n, G.e, tile, codes, scales, gsc, ybuf, red);
+        else down_item<4>(act, G.routes, G.n, G.e, tile, codes, scales, gsc, ybuf, red);
     }
 }
 
@@ -606,72 +468,55 @@ __global__ void __launch_bounds__(256) moe_combine_kernel(
 // pdl: launch with programmatic stream serialization, so the kernel may start before the
 // previous one ends; the kernels order themselves with griddepcontrol.
 template <typename... KArgs, typename... Args>
-static cudaError_t launch(bool pdl, void (*kernel)(KArgs...), int grid, int smem, cudaStream_t st,
-                          Args... args) {
+static cudaError_t launch(bool pdl, void (*kernel)(KArgs...), int grid, cudaStream_t st, Args... args) {
     cudaLaunchAttribute attr[1];
     attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attr[0].val.programmaticStreamSerializationAllowed = 1;
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = dim3(grid);
     cfg.blockDim = dim3(256);
-    cfg.dynamicSmemBytes = smem;
+    cfg.dynamicSmemBytes = 0;
     cfg.stream = st;
     cfg.attrs = attr;
     cfg.numAttrs = pdl ? 1 : 0;
     return cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...);
 }
 
-template <typename... KArgs>
-static void allow_smem(void (*kernel)(KArgs...), int smem) {
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-}
-
-// Bits of `pdl`: 1 up, 2 down, 4 combine launch with PDL. 8 (diagnostic): the down kernel keeps
-// read-only-cache loads of act even under PDL.
 template <int MT_CAP>
-static void launch_experts(int pdl, int pipe, const void* x, const int* meta, const int* list, int local_start,
-                           const void* c13, const void* s13, const float* gs13, const void* c2, const void* s2,
-                           const float* gs2, void* act, void* ybuf, int grid, cudaStream_t st,
+static void launch_experts(bool pdl, int stagger, int nsm, const void* x, const int* meta, const int* list,
+                           int local_start, const void* c13, const void* s13, const float* gs13, const void* c2,
+                           const void* s2, const float* gs2, void* act, void* ybuf, int grid, cudaStream_t st,
                            cudaError_t& e1, cudaError_t& e2) {
-    const bool nc = !(pdl & 2) || (pdl & 8);
-    const auto xa = (const __nv_bfloat16*)x;
-    const auto aa = (const __nv_bfloat16*)act;
-    if (pipe) {
-        allow_smem(moe_up_pipe<MT_CAP>, UP_STAGE);
-        e1 = launch(pdl & 1, moe_up_pipe<MT_CAP>, grid, UP_STAGE, st, xa, meta, list, local_start,
-                    (const int4*)c13, (const int4*)s13, gs13, (__nv_bfloat16*)act);
-        auto dk = nc ? moe_down_pipe<MT_CAP, true> : moe_down_pipe<MT_CAP, false>;
-        allow_smem(dk, DN_STAGE);
-        e2 = launch(pdl & 2, dk, grid, DN_STAGE, st, aa, meta, list, local_start, (const int4*)c2,
-                    (const int4*)s2, gs2, (__nv_bfloat16*)ybuf);
-    } else {
-        e1 = launch(pdl & 1, moe_up_kernel<MT_CAP>, grid, 0, st, xa, meta, list, local_start,
-                    (const int4*)c13, (const int4*)s13, gs13, (__nv_bfloat16*)act);
-        auto dk = nc ? moe_down_kernel<MT_CAP, true> : moe_down_kernel<MT_CAP, false>;
-        e2 = launch(pdl & 2, dk, grid, 0, st, aa, meta, list, local_start, (const int4*)c2, (const int4*)s2,
-                    gs2, (__nv_bfloat16*)ybuf);
-    }
+    e1 = launch(pdl, moe_up_kernel<MT_CAP>, grid, st, (const __nv_bfloat16*)x, meta, list, local_start,
+                (const int4*)c13, (const int4*)s13, gs13, (__nv_bfloat16*)act, stagger, nsm);
+    // Never PDL: its activation loads use the read-only cache, so the up kernel must have ended.
+    e2 = launch(false, moe_down_kernel<MT_CAP>, grid, st, (const __nv_bfloat16*)act, meta, list, local_start,
+                (const int4*)c2, (const int4*)s2, gs2, (__nv_bfloat16*)ybuf, stagger, nsm);
 }
 
+// pdl: the up kernel overlaps the route kernel, the combine kernel overlaps the down kernel's tail.
+// grid: two blocks per SM; stagger: see stagger_start.
 cudaError_t moe_launch(const void* x, const int* ids, const float* wts, int M, int local_start,
                        const void* c13, const void* s13, const float* gs13, const void* c2, const void* s2,
                        const float* gs2, const void* norm_w, void* act, void* ybuf, int* meta,
-                       int* list, int grid, void* out, int pdl, int pipe, cudaStream_t st) {
+                       int* list, int grid, void* out, int pdl, int stagger, cudaStream_t st) {
     const int n_ids = M * TOPK;
     if (n_ids > 32 * MAX_GROUPS - 32 * LOCAL) return cudaErrorInvalidValue;  // groups always fit
     moe_route_kernel<<<1, 1024, 0, st>>>(ids, n_ids, local_start, meta, list);
-    // M=8 benefits from three blocks per SM (MT1 registers allow it, the pipe stage does not).
-    const int g = (M == 8 && !pipe) ? grid + grid / 2 : grid;
+    const int nsm = grid / 2;
+    const int g = M == 8 ? grid + grid / 2 : grid;  // M=8 benefits from three blocks per SM; M=1 does not
     cudaError_t e1, e2;
     // topk gives each token distinct experts: n<=M, so M<=8 uses MT=1 and M<=16 uses MT<=2.
     if (M <= 8)
-        launch_experts<1>(pdl, pipe, x, meta, list, local_start, c13, s13, gs13, c2, s2, gs2, act, ybuf, g, st, e1, e2);
+        launch_experts<1>(pdl, stagger, nsm, x, meta, list, local_start, c13, s13, gs13, c2, s2, gs2, act, ybuf, g,
+                          st, e1, e2);
     else if (M <= 16)
-        launch_experts<2>(pdl, pipe, x, meta, list, local_start, c13, s13, gs13, c2, s2, gs2, act, ybuf, g, st, e1, e2);
+        launch_experts<2>(pdl, stagger, nsm, x, meta, list, local_start, c13, s13, gs13, c2, s2, gs2, act, ybuf, g,
+                          st, e1, e2);
     else
-        launch_experts<4>(pdl, pipe, x, meta, list, local_start, c13, s13, gs13, c2, s2, gs2, act, ybuf, g, st, e1, e2);
-    const cudaError_t e3 = launch(pdl & 4, moe_combine_kernel, M, 0, st, ids, wts, local_start,
+        launch_experts<4>(pdl, stagger, nsm, x, meta, list, local_start, c13, s13, gs13, c2, s2, gs2, act, ybuf, g,
+                          st, e1, e2);
+    const cudaError_t e3 = launch(pdl, moe_combine_kernel, M, st, ids, wts, local_start,
                                   (const __nv_bfloat16*)norm_w, (const __nv_bfloat16*)ybuf, (__nv_bfloat16*)out);
     if (e1 != cudaSuccess) return e1;
     if (e2 != cudaSuccess) return e2;
@@ -687,18 +532,18 @@ CUDA_TORCH = r"""
 cudaError_t moe_launch(const void* x, const int* ids, const float* wts, int M, int local_start,
                        const void* c13, const void* s13, const float* gs13, const void* c2, const void* s2,
                        const float* gs2, const void* norm_w, void* act, void* ybuf, int* meta,
-                       int* list, int grid, void* out, int pdl, int pipe, cudaStream_t st);
+                       int* list, int grid, void* out, int pdl, int stagger, cudaStream_t st);
 
 void moe_forward(torch::Tensor x, torch::Tensor ids, torch::Tensor wts, int64_t local_start,
                  torch::Tensor c13, torch::Tensor s13, torch::Tensor gs13, torch::Tensor c2, torch::Tensor s2,
                  torch::Tensor gs2, torch::Tensor norm_w, torch::Tensor act, torch::Tensor ybuf,
                  torch::Tensor meta, torch::Tensor list, int64_t grid, torch::Tensor out, int64_t pdl,
-                 int64_t pipe) {
+                 int64_t stagger) {
     const cudaError_t err = moe_launch(
         x.data_ptr(), ids.data_ptr<int>(), wts.data_ptr<float>(), x.size(0), local_start, c13.data_ptr(),
         s13.data_ptr(), gs13.data_ptr<float>(), c2.data_ptr(), s2.data_ptr(), gs2.data_ptr<float>(),
         norm_w.data_ptr(), act.data_ptr(), ybuf.data_ptr(), meta.data_ptr<int>(), list.data_ptr<int>(), grid,
-        out.data_ptr(), pdl, pipe, at::cuda::getCurrentCUDAStream());
+        out.data_ptr(), pdl, stagger, at::cuda::getCurrentCUDAStream());
     TORCH_CHECK(err == cudaSuccess, "moe_forward: ", cudaGetErrorString(err));
 }
 """
@@ -708,7 +553,7 @@ void moe_forward(torch::Tensor x, torch::Tensor ids, torch::Tensor wts, int64_t 
                  torch::Tensor c13, torch::Tensor s13, torch::Tensor gs13, torch::Tensor c2, torch::Tensor s2,
                  torch::Tensor gs2, torch::Tensor norm_w, torch::Tensor act, torch::Tensor ybuf,
                  torch::Tensor meta, torch::Tensor list, int64_t grid, torch::Tensor out, int64_t pdl,
-                 int64_t pipe);
+                 int64_t stagger);
 """
 
 # New nibble p of each packed 32-bit word holds original value NIBBLE_SRC[p] of that word.
@@ -736,9 +581,9 @@ def pack_scales(sf):
 
 
 _MOD = None
-# Judged launch configuration. PDL: bit mask (1 up, 2 down, 4 combine). PIPE: one-stage cp.async
-# prefetch of each block's next item.
-PDL, PIPE = 0, 1
+# Judged launch configuration. PDL: the up kernel overlaps the route kernel and the combine kernel
+# overlaps the down kernel. STAGGER: probe only, ns of start delay per resident block slot.
+PDL, STAGGER = 1, 0
 # Timing and correctness table from prepare() (check runs only; False for scored submits).
 BENCH = True
 
@@ -748,7 +593,7 @@ def _cuda():
     if _MOD is None:
         from torch.utils.cpp_extension import load_inline
         t0 = time.time()
-        _MOD = load_inline(name="muse_moe_v13", cpp_sources=CPP_DECLS, cuda_sources=CUDA_SRC + CUDA_TORCH,
+        _MOD = load_inline(name="muse_moe_v14", cpp_sources=CPP_DECLS, cuda_sources=CUDA_SRC + CUDA_TORCH,
                            functions=["moe_forward"], extra_cuda_cflags=["-O3"], verbose=False)
         print(f"CUDA compiled in {time.time() - t0:.0f}s", flush=True)
     return _MOD
@@ -763,7 +608,7 @@ def prepare(weights: Weights):
         "norm_w": weights["post_norm_w"].contiguous(),  # BF16, as given; kernels use 1 + w
         "meta": torch.zeros(1 + 3 * MAX_GROUPS, device=weights["w13"].device, dtype=torch.int32),
         "grid": 2 * torch.cuda.get_device_properties(weights["w13"].device).multi_processor_count,  # two resident blocks per SM
-        "pdl": PDL, "pipe": PIPE,
+        "pdl": PDL, "stagger": STAGGER,
     }
     _cuda()
     if BENCH:
@@ -782,7 +627,7 @@ def kernel_fn(data: Inputs, state) -> torch.Tensor:
     _MOD.moe_forward(x, ids, data["topk_weights"].contiguous(), data["config"]["local_start"],
                      state["c13"], state["s13"], state["gs13"], state["c2"], state["s2"], state["gs2"],
                      state["norm_w"], act, ybuf, state["meta"], routes, state["grid"], out,
-                     state["pdl"], state["pipe"])
+                     state["pdl"], state["stagger"])
     return out
 
 
@@ -848,8 +693,8 @@ def _graph_us(fn, flush, reps=30):
     return ts[len(ts) // 2], out
 
 
-_VARIANTS = (("base", 0, 0), ("pdl7", 7, 0), ("pdl1", 1, 0), ("pdl2", 2, 0), ("pdl4", 4, 0),
-             ("pdl10", 10, 0), ("pipe", 0, 1), ("pipe+7", 7, 1))
+_VARIANTS = (("base", 0, 0), ("pdl", 1, 0), ("st1000", 0, 1000), ("st2000", 0, 2000), ("st3500", 0, 3500),
+             ("st6000", 0, 6000), ("pdl+st2k", 1, 2000))
 
 
 def _bench(state, weights):
@@ -867,8 +712,8 @@ def _bench(state, weights):
             ref = _ref(x, ids, w, weights)
             rn = ref.norm()
             ts, errs = [], []
-            for vname, pdl, pipe in _VARIANTS:
-                st = dict(state, pdl=pdl, pipe=pipe)
+            for vname, pdl, stagger in _VARIANTS:
+                st = dict(state, pdl=pdl, stagger=stagger)
                 try:
                     err = 0.0
                     for _ in range(3):
